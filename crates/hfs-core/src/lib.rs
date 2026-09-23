@@ -14,7 +14,16 @@
 //!    how it was measured. Judgment about what to do with those facts lives
 //!    elsewhere, so that it can be inspected and tested separately.
 //!
-//! Nothing is implemented yet. This crate exists so the workspace has a
-//! defined shape before code starts arriving.
+//! The accounting types encode the project's central claim: a file does not
+//! necessarily own its bytes, and a reclaim estimate that assumes otherwise is
+//! wrong in the optimistic direction. See [`bytes::Ownership`].
 
 #![forbid(unsafe_code)]
+
+pub mod accounting;
+pub mod bytes;
+pub mod identity;
+
+pub use accounting::{reconcile, Accounting, Denied, Reconciliation};
+pub use bytes::{ExtentBytes, Ownership};
+pub use identity::{FileId, FileKey, VolumeId};

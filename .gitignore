@@ -3,6 +3,9 @@
 **/*.rs.bk
 *.pdb
 
+# Scratch output from local tooling
+*.log
+
 # Local scan artifacts. An index is derived data and is rebuildable; it is also
 # a map of somebody's machine, so it must never be committed.
 *.hfsdb

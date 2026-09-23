@@ -1,6 +1,5 @@
 [toolchain]
-# Pinned to `stable` for now. Replace with a concrete version (e.g. "1.90.0")
-# once the toolchain is installed, so builds are reproducible and CI matches
-# developer machines exactly.
-channel = "stable"
+# Pinned to a concrete version so builds are reproducible and CI matches
+# developer machines exactly. Bump deliberately, not by accident.
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
