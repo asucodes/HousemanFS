@@ -82,7 +82,10 @@ fn scan(path: &str) -> Result<(), String> {
     println!("files       {}", s.files);
     println!("directories {}", s.directories);
     println!("reparse     {}", s.reparse_points);
-    println!("unreadable  {}", s.denied);
+    println!(
+        "unreadable  {} directories, {} files",
+        s.denied_directories, s.denied_files
+    );
     println!();
     println!("logical     {}", human(s.logical_bytes));
     println!("allocated   {}", human(s.allocated_bytes));
@@ -112,12 +115,25 @@ fn scan(path: &str) -> Result<(), String> {
         println!("      may have been counted more than once. Treat the total as approximate.");
     }
 
-    if s.denied > 0 {
+    if s.denied_directories > 0 || s.denied_files > 0 {
         println!();
-        println!(
-            "note: {} paths could not be read, so the totals above are incomplete.",
-            s.denied
-        );
+        if s.denied_directories > 0 {
+            println!(
+                "note: {} directories could not be opened. Everything beneath them is",
+                s.denied_directories
+            );
+            println!(
+                "      missing from the totals above, which is the likeliest home of any gap."
+            );
+        }
+        if s.denied_files > 0 {
+            println!(
+                "note: {} files could not be opened. Their reported size, {}, is included,",
+                s.denied_files,
+                human(s.denied_file_bytes)
+            );
+            println!("      but their true allocation is unknown.");
+        }
     }
 
     // A residual only means anything if the scan covered a whole volume. Comparing a subtree's
@@ -152,7 +168,7 @@ fn reconcile_volume(path: &str, s: &WalkSummary) -> Result<(), String> {
         stream_bytes: 0,
         directory_bytes: 0,
         known_metadata: None,
-        denied: Denied::new(s.denied),
+        denied: Denied::new(s.denied_directories.saturating_add(s.denied_files)),
     };
 
     let residual = accounting.residual();
@@ -171,8 +187,18 @@ fn reconcile_volume(path: &str, s: &WalkSummary) -> Result<(), String> {
     println!("  filesystem metadata   MFT, journals, bitmaps — not visible to a directory walk");
     println!("  alternate streams     not yet enumerated");
     println!("  directory overhead    not yet enumerated");
-    if s.denied > 0 {
-        println!("  unreadable paths      {} paths", s.denied);
+    if s.denied_directories > 0 {
+        println!(
+            "  unreadable directories {} — contents entirely unknown",
+            s.denied_directories
+        );
+    }
+    if s.denied_files > 0 {
+        println!(
+            "  unreadable files       {} totalling {}",
+            s.denied_files,
+            human(s.denied_file_bytes)
+        );
     }
 
     match reconcile(&accounting, RESIDUAL_TOLERANCE) {

@@ -62,8 +62,18 @@ pub struct WalkSummary {
     pub files: u64,
     pub directories: u64,
     pub reparse_points: u64,
-    /// Paths that could not be read.
-    pub denied: u64,
+
+    /// Directories that could not be opened, so their contents are entirely unknown.
+    ///
+    /// These are the dangerous ones. An unreadable *file* is a known quantity of unknown size;
+    /// an unreadable *directory* hides everything beneath it, which can be arbitrarily large.
+    /// Distinguishing the two is what turns "1,769 unreadable paths" into a diagnosis.
+    pub denied_directories: u64,
+    /// Files that could not be opened.
+    pub denied_files: u64,
+    /// Reported size of those files: a lower bound on what they occupy, since the directory
+    /// entry still tells us their logical size even when we cannot open them.
+    pub denied_file_bytes: u64,
 
     /// Summed logical size, counting each hardlink group once.
     pub logical_bytes: u64,
@@ -128,7 +138,7 @@ pub fn walk_with(root: &str, options: WalkOptions) -> io::Result<Walk> {
             // An unreadable directory is recorded and skipped. Aborting the whole scan because
             // one directory is protected would make the tool useless on a real system, and
             // silently ignoring it would make the numbers quietly wrong.
-            Err(_) => summary.denied += 1,
+            Err(_) => summary.denied_directories += 1,
         }
     }
 
@@ -232,9 +242,10 @@ fn record_file(
         Ok(facts) => (facts.allocated, facts.links, facts.id),
         Err(_) => {
             // Still counted, using the size the directory entry reported, so a locked or
-            // protected file does not silently vanish from the totals. The shortfall shows up
-            // as an unreadable path rather than being hidden.
-            summary.denied += 1;
+            // protected file does not silently vanish from the totals. Its true allocation is
+            // unknown, which is recorded rather than estimated.
+            summary.denied_files += 1;
+            summary.denied_file_bytes += logical;
             (logical, 1, None)
         }
     };
