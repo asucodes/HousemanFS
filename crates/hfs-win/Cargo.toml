@@ -1,0 +1,12 @@
+[package]
+name = "hfs-win"
+description = "Windows platform layer. All operating-system interaction lives here."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hfs-core = { path = "../hfs-core" }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }

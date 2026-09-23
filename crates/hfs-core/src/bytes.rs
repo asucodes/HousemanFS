@@ -156,7 +156,11 @@ mod tests {
         let size = ExtentBytes::new(2 * GB, 2 * GB);
         let result = Ownership::Unknown.reclaimable_bytes(size);
 
-        assert_ne!(result, Some(0), "unknown is not the same as freeing nothing");
+        assert_ne!(
+            result,
+            Some(0),
+            "unknown is not the same as freeing nothing"
+        );
         assert_ne!(result, Some(2 * GB), "unknown is not the same as unique");
         assert_eq!(result, None);
     }

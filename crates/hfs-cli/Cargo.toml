@@ -1,0 +1,16 @@
+[package]
+name = "hfs-cli"
+description = "Command-line interface for HousemanFS."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "housemanfs"
+path = "src/main.rs"
+
+[dependencies]
+hfs-core = { path = "../hfs-core" }
+hfs-win = { path = "../hfs-win" }

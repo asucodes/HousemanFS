@@ -24,6 +24,6 @@ pub mod accounting;
 pub mod bytes;
 pub mod identity;
 
-pub use accounting::{reconcile, Accounting, Denied, Reconciliation};
+pub use accounting::{Accounting, Denied, Reconciliation, reconcile};
 pub use bytes::{ExtentBytes, Ownership};
 pub use identity::{FileId, FileKey, VolumeId};
