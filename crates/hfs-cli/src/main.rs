@@ -253,7 +253,11 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
     // directory walk cannot see and which occupies real space. Querying it needs a handle to
     // the volume, and therefore administrator rights. Without them this returns `None` and the
     // residual absorbs the difference, which is exactly what the privilege line warns about.
-    let metadata = ntfs_metadata(path).ok().flatten();
+    // The reason matters as much as the absence. "Not available on this filesystem" and "the
+    // query was refused" look identical if only the missing value is reported, and that
+    // ambiguity once hid a real bug: an elevated scan reported its metadata as unmeasured.
+    let metadata_query = ntfs_metadata(path);
+    let metadata = metadata_query.as_ref().ok().and_then(|m| *m);
 
     let known_metadata = metadata
         .as_ref()
@@ -302,10 +306,17 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
             let _ = writeln!(out, "  directory overhead    not yet enumerated");
         }
         None => {
-            let _ = writeln!(
-                out,
-                "  filesystem metadata   not measured — requires an elevated scan"
-            );
+            match &metadata_query {
+                Err(err) => {
+                    let _ = writeln!(out, "  filesystem metadata   query refused: {err}");
+                }
+                _ => {
+                    let _ = writeln!(
+                        out,
+                        "  filesystem metadata   not measured — requires an elevated scan"
+                    );
+                }
+            }
             let _ = writeln!(out, "  alternate streams     not yet enumerated");
             let _ = writeln!(out, "  directory overhead    not yet enumerated");
         }

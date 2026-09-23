@@ -15,7 +15,7 @@
 
 use std::io;
 
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
@@ -102,9 +102,10 @@ pub fn ntfs_metadata(mount: &str) -> io::Result<Option<NtfsMetadata>> {
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            // No data access is requested. The control codes below need a handle, not a read
-            // capability, so asking for less keeps the failure mode narrower.
-            0,
+            // Read access is required, not optional. A volume handle opened with no access
+            // satisfies `CreateFileW` but the resulting handle is refused by `DeviceIoControl`,
+            // so the query fails while appearing to have opened successfully.
+            GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,
