@@ -20,4 +20,4 @@ pub mod volume;
 pub mod walk;
 
 pub use volume::{VolumeInfo, volume_info};
-pub use walk::{EntryKind, ScannedEntry, WalkSummary, walk};
+pub use walk::{EntryKind, ScannedEntry, Walk, WalkOptions, WalkSummary, walk, walk_with};
