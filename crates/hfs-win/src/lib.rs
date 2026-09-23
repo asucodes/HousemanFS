@@ -17,9 +17,11 @@
 mod util;
 
 pub mod elevation;
+pub mod ntfs;
 pub mod volume;
 pub mod walk;
 
 pub use elevation::is_elevated;
+pub use ntfs::{NtfsMetadata, ntfs_metadata};
 pub use volume::{VolumeInfo, volume_info};
 pub use walk::{EntryKind, ScannedEntry, Walk, WalkOptions, WalkSummary, walk, walk_with};
