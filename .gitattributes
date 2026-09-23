@@ -1,0 +1,10 @@
+# Normalize line endings to LF in the repository regardless of the platform a
+# contributor is on. Without this, Windows checkouts rewrite every text file to
+# CRLF and produce diffs that touch whole files.
+* text=auto eol=lf
+
+# Test fixtures are generated disk images. They are binary and must never be
+# line-ending converted or diffed as text.
+*.vhdx binary
+*.vhd  binary
+*.img  binary
