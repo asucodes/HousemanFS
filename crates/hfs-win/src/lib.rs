@@ -16,8 +16,10 @@
 
 mod util;
 
+pub mod elevation;
 pub mod volume;
 pub mod walk;
 
+pub use elevation::is_elevated;
 pub use volume::{VolumeInfo, volume_info};
 pub use walk::{EntryKind, ScannedEntry, Walk, WalkOptions, WalkSummary, walk, walk_with};

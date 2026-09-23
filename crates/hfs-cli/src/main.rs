@@ -6,7 +6,7 @@
 use std::process::ExitCode;
 
 use hfs_core::{Accounting, Denied, Reconciliation, reconcile};
-use hfs_win::{WalkSummary, volume_info, walk};
+use hfs_win::{WalkSummary, is_elevated, volume_info, walk};
 
 const USAGE: &str = "\
 housemanfs — read-only filesystem accounting
@@ -78,6 +78,14 @@ fn scan(path: &str) -> Result<(), String> {
     let s = &result.summary;
 
     println!("scanned     {path}");
+    println!(
+        "privilege   {}",
+        if is_elevated() {
+            "elevated"
+        } else {
+            "standard user"
+        }
+    );
     println!();
     println!("files       {}", s.files);
     println!("directories {}", s.directories);
@@ -199,6 +207,17 @@ fn reconcile_volume(path: &str, s: &WalkSummary) -> Result<(), String> {
             s.denied_files,
             human(s.denied_file_bytes)
         );
+    }
+
+    if s.denied_directories > 0 && !is_elevated() {
+        println!();
+        println!(
+            "{} directories are unreadable at this privilege level. Running the scan from an",
+            s.denied_directories
+        );
+        println!("elevated shell would open them and account for their contents.");
+        println!("The largest is usually System Volume Information, which holds shadow copies");
+        println!("and can occupy up to a tenth of the volume.");
     }
 
     match reconcile(&accounting, RESIDUAL_TOLERANCE) {
