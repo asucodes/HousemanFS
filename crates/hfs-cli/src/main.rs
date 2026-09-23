@@ -163,6 +163,7 @@ fn scan(path: &str, out: &mut String) -> Result<(), String> {
     let _ = writeln!(out, "logical     {}", human(s.logical_bytes));
     let _ = writeln!(out, "allocated   {}", human(s.allocated_bytes));
     let _ = writeln!(out, "slack       {}", human(s.slack_bytes));
+    let _ = writeln!(out, "dir index   {}", human(s.directory_bytes));
 
     if s.hardlinked_files > 0 {
         let _ = writeln!(out);
@@ -267,10 +268,10 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
         total: v.total_bytes,
         free: v.free_bytes,
         file_bytes: s.allocated_bytes,
-        // Alternate data streams and directory overhead are not yet enumerated. Left at zero so
-        // the residual absorbs them honestly rather than being flattered by an estimate.
+        // Alternate data streams are not yet enumerated. Left at zero so the residual absorbs
+        // them honestly rather than being flattered by an estimate.
         stream_bytes: 0,
-        directory_bytes: 0,
+        directory_bytes: s.directory_bytes,
         known_metadata,
         denied: Denied::new(s.denied_directories.saturating_add(s.denied_files)),
     };
@@ -302,25 +303,25 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
                     human(m.usn_journal_max_bytes)
                 );
             }
-            let _ = writeln!(out, "  alternate streams     not yet enumerated");
-            let _ = writeln!(out, "  directory overhead    not yet enumerated");
         }
-        None => {
-            match &metadata_query {
-                Err(err) => {
-                    let _ = writeln!(out, "  filesystem metadata   query refused: {err}");
-                }
-                _ => {
-                    let _ = writeln!(
-                        out,
-                        "  filesystem metadata   not measured — requires an elevated scan"
-                    );
-                }
+        None => match &metadata_query {
+            Err(err) => {
+                let _ = writeln!(out, "  filesystem metadata   query refused: {err}");
             }
-            let _ = writeln!(out, "  alternate streams     not yet enumerated");
-            let _ = writeln!(out, "  directory overhead    not yet enumerated");
-        }
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "  filesystem metadata   not measured — requires an elevated scan"
+                );
+            }
+        },
     }
+    let _ = writeln!(
+        out,
+        "  directory overhead    {} — measured",
+        human(s.directory_bytes)
+    );
+    let _ = writeln!(out, "  alternate streams     not yet enumerated");
     if s.denied_directories > 0 {
         let _ = writeln!(
             out,

@@ -77,10 +77,18 @@ pub struct WalkSummary {
 
     /// Summed logical size, counting each hardlink group once.
     pub logical_bytes: u64,
-    /// Physical bytes occupied, counting each hardlink group once.
+    /// Physical bytes occupied by file data, counting each hardlink group once.
     pub allocated_bytes: u64,
     /// Bytes lost to rounding files up to whole clusters.
     pub slack_bytes: u64,
+
+    /// Physical bytes occupied by directories themselves.
+    ///
+    /// A directory is not free. Its index blocks live outside the master file table and hold
+    /// the names it contains, and a walk that lists names never sees them. Reported separately
+    /// from file data because it is a different kind of occupancy: nothing can be reclaimed by
+    /// removing it, but it is still part of where the space went.
+    pub directory_bytes: u64,
 
     /// Files that have more than one name.
     pub hardlinked_files: u64,
@@ -200,12 +208,20 @@ fn read_directory(
                 }
             } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
                 summary.directories += 1;
+
+                // Ask the directory what it occupies. Its index blocks are allocated outside
+                // the master file table and hold the names it contains, so a walk that only
+                // lists names never sees them. A failure here is not fatal: the directory is
+                // still traversed, it simply contributes no measured overhead.
+                let allocated = query_file(&path).map(|f| f.allocated).unwrap_or(0);
+                summary.directory_bytes += allocated;
+
                 if options.collect_entries {
                     entries.push(ScannedEntry {
                         path: path.clone(),
                         kind: EntryKind::Directory,
                         logical: 0,
-                        allocated: 0,
+                        allocated,
                         links: 0,
                     });
                 }
