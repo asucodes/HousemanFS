@@ -1,0 +1,10 @@
+[package]
+name = "hfs-core"
+description = "Platform-neutral data model: file identity, storage accounting, and the evidence behind every claim."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

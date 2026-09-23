@@ -1,0 +1,20 @@
+//! Platform-neutral data model for HousemanFS.
+//!
+//! This crate holds the types that describe a scanned volume without touching
+//! any operating-system API: file identity, storage accounting, and the
+//! evidence attached to every claim the tool makes.
+//!
+//! Two rules govern what belongs here:
+//!
+//! 1. **No platform code.** Anything that calls into an operating system
+//!    belongs in a platform crate. Keeping this crate pure is what makes the
+//!    data model testable anywhere, and it is the seam that would let a
+//!    second platform be added later without redesigning the model.
+//! 2. **No decisions, only facts.** Types here describe what was observed and
+//!    how it was measured. Judgment about what to do with those facts lives
+//!    elsewhere, so that it can be inspected and tested separately.
+//!
+//! Nothing is implemented yet. This crate exists so the workspace has a
+//! defined shape before code starts arriving.
+
+#![forbid(unsafe_code)]

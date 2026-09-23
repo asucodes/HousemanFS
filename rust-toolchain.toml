@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned to `stable` for now. Replace with a concrete version (e.g. "1.90.0")
+# once the toolchain is installed, so builds are reproducible and CI matches
+# developer machines exactly.
+channel = "stable"
+components = ["rustfmt", "clippy"]

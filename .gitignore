@@ -1,0 +1,11 @@
+# Rust build output
+/target
+**/*.rs.bk
+*.pdb
+
+# Local scan artifacts. An index is derived data and is rebuildable; it is also
+# a map of somebody's machine, so it must never be committed.
+*.hfsdb
+*.hfsindex
+*.hfseval
+/local/
