@@ -6,8 +6,12 @@ accounting being correct, so the accounting gets built and verified first.
 
 ## Current status
 
-Nothing functional exists yet. The repository contains project structure, design documents, and
-decisions. The Rust toolchain is not yet installed on the development machine.
+Phase 0 has started. The toolchain is installed and pinned (Rust 1.98.1, GNU target). `hfs-core`
+holds the accounting model: file identity, extent ownership, and volume-level reconciliation
+with an explicit residual — 17 tests, all passing.
+
+Nothing scans a real volume yet. That is the next step, and it is the point where the model
+stops being a claim and becomes a measurement.
 
 ## Phase 0 — the accounting oracle
 

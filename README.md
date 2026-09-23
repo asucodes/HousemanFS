@@ -3,9 +3,10 @@
 A local, read-only filesystem index that tells you the truth about your storage, lets you ask
 questions about it in plain language, and shows the evidence behind every number it reports.
 
-> **Status: early design. No functional code yet.**
-> The repository currently contains the project structure, the design documents, and the
-> decisions behind them. Nothing here scans anything. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
+> **Status: Phase 0 in progress.**
+> The accounting model exists in `hfs-core`: file identity, extent ownership, and volume
+> reconciliation with an explicit residual, all covered by tests. Nothing scans a real volume
+> yet, and nothing writes to one. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ---
 
