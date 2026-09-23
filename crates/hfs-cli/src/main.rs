@@ -59,6 +59,19 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    // Validate the output path before doing any work. A whole-volume scan can take minutes, and
+    // discovering afterwards that the path was unusable wastes the scan and loses the result.
+    // Failing fast turns a lost report into an immediate, obvious error.
+    if let Some(file) = &out_file {
+        if let Err(err) = std::fs::File::create(file) {
+            eprintln!("error: cannot write to {file}: {err}");
+            eprintln!();
+            eprintln!("note: %TEMP% is cmd syntax. In PowerShell use $env:TEMP, or pass a");
+            eprintln!("      plain relative path such as --out report.txt");
+            return ExitCode::FAILURE;
+        }
+    }
+
     let mut out = String::new();
 
     let result = match command.as_str() {
