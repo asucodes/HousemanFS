@@ -33,6 +33,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::util::{from_wide, last_error, to_wide};
 
+/// How many unreadable directory paths to retain for reporting.
+///
+/// Enough to reveal the pattern — usually one or two system directories account for all of them
+/// — without turning the report into a wall of paths on a badly permissioned volume.
+const DENIED_SAMPLE_LIMIT: usize = 12;
+
 /// What a directory entry is, from the scanner's point of view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -69,6 +75,14 @@ pub struct WalkSummary {
     /// an unreadable *directory* hides everything beneath it, which can be arbitrarily large.
     /// Distinguishing the two is what turns "1,769 unreadable paths" into a diagnosis.
     pub denied_directories: u64,
+
+    /// A sample of those directories, by path.
+    ///
+    /// Naming them is the difference between a number and something a user can act on. A count
+    /// tells you the accounting is incomplete; the paths tell you *where* it is incomplete, and
+    /// usually point straight at the cause. Capped, because a badly permissioned volume could
+    /// have thousands and listing them all would bury the answer.
+    pub denied_directory_samples: Vec<String>,
     /// Files that could not be opened.
     pub denied_files: u64,
     /// Reported size of those files: a lower bound on what they occupy, since the directory
@@ -146,7 +160,14 @@ pub fn walk_with(root: &str, options: WalkOptions) -> io::Result<Walk> {
             // An unreadable directory is recorded and skipped. Aborting the whole scan because
             // one directory is protected would make the tool useless on a real system, and
             // silently ignoring it would make the numbers quietly wrong.
-            Err(_) => summary.denied_directories += 1,
+            Err(_) => {
+                summary.denied_directories += 1;
+                if summary.denied_directory_samples.len() < DENIED_SAMPLE_LIMIT {
+                    summary
+                        .denied_directory_samples
+                        .push(dir.display().to_string());
+                }
+            }
         }
     }
 

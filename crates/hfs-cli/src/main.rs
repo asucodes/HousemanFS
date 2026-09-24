@@ -215,6 +215,17 @@ fn scan(path: &str, out: &mut String) -> Result<(), String> {
                 out,
                 "      missing from the totals above, which is the likeliest home of any gap."
             );
+            for path in &s.denied_directory_samples {
+                let _ = writeln!(out, "      {path}");
+            }
+            let shown = s.denied_directory_samples.len();
+            if (s.denied_directories as usize) > shown {
+                let _ = writeln!(
+                    out,
+                    "      ... and {} more",
+                    s.denied_directories as usize - shown
+                );
+            }
         }
         if s.denied_files > 0 {
             let _ = writeln!(
@@ -362,6 +373,17 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
             "  unreadable directories {} — contents entirely unknown",
             s.denied_directories
         );
+        for path in &s.denied_directory_samples {
+            let _ = writeln!(out, "    {path}");
+        }
+        let shown = s.denied_directory_samples.len();
+        if (s.denied_directories as usize) > shown {
+            let _ = writeln!(
+                out,
+                "    ... and {} more",
+                s.denied_directories as usize - shown
+            );
+        }
     }
     if s.denied_files > 0 {
         let _ = writeln!(
