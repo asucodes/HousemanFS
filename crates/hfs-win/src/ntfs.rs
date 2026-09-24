@@ -17,7 +17,9 @@ use std::io;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileStandardInfo,
+    GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -209,6 +211,110 @@ fn volume_device_path(mount: &str) -> String {
     // Fall back to the path as given. The open will fail for anything that is not a volume,
     // which is the correct outcome rather than a silent wrong answer.
     trimmed.to_string()
+}
+
+/// One of NTFS's own system files.
+#[derive(Debug, Clone)]
+pub struct SystemFile {
+    pub name: String,
+    /// Bytes actually occupied, or `None` if the file could not be measured.
+    pub allocated: Option<u64>,
+}
+
+/// The NTFS system files, by their names in the root directory.
+///
+/// These are ordinary entries in the root directory index, but NTFS marks them as metadata and
+/// **excludes them from directory enumeration**. A walk therefore never sees them, and their
+/// space is invisible to it. `$MFT` is deliberately omitted here because it is measured through
+/// `FSCTL_GET_NTFS_VOLUME_DATA` instead, and counting it twice would overstate the total.
+const SYSTEM_FILES: [&str; 11] = [
+    "$MFTMirr",
+    "$LogFile",
+    "$Bitmap",
+    "$Boot",
+    "$BadClus",
+    "$Secure",
+    "$UpCase",
+    r"$Extend\$ObjId",
+    r"$Extend\$Quota",
+    r"$Extend\$Reparse",
+    r"$Extend\$UsnJrnl",
+];
+
+/// Measure the NTFS system files that a directory walk cannot see.
+///
+/// Requires administrator rights, like every other volume-level query. Files that cannot be
+/// opened are returned with `None` rather than being omitted, so the caller can report what
+/// could not be measured instead of silently under-reporting.
+pub fn system_files(mount: &str) -> Vec<SystemFile> {
+    let root = mount.trim_end_matches(['\\', '/']);
+
+    SYSTEM_FILES
+        .iter()
+        .map(|name| {
+            let path = format!(r"{root}\{name}");
+            SystemFile {
+                name: name.to_string(),
+                allocated: allocated_size(&path).ok(),
+            }
+        })
+        .collect()
+}
+
+/// The allocation of `$MFT` itself.
+///
+/// Preferred over the value in `FSCTL_GET_NTFS_VOLUME_DATA`, which reports the *valid data
+/// length*: the portion of the table holding live records. The table is allocated in larger
+/// chunks than that, so the valid length understates what the table actually occupies.
+pub fn mft_allocation(mount: &str) -> Option<u64> {
+    let root = mount.trim_end_matches(['\\', '/']);
+    allocated_size(&format!(r"{root}\$MFT")).ok()
+}
+
+/// Ask the filesystem how many bytes a path occupies, without reading any of it.
+fn allocated_size(path: &str) -> io::Result<u64> {
+    let wide = to_wide(path);
+
+    // SAFETY: `wide` is NUL-terminated and outlives the call; remaining arguments are constants
+    // or documented-acceptable nulls. `FILE_FLAG_BACKUP_SEMANTICS` is required to open entries
+    // that are directories or metadata rather than ordinary files.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(last_error());
+    }
+
+    let mut standard: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+
+    // SAFETY: `handle` is valid and open; the buffer matches the requested information class
+    // and its true size is passed.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStandardInfo,
+            &mut standard as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+
+    // SAFETY: `handle` is valid and closed exactly once, on every path below.
+    unsafe { CloseHandle(handle) };
+
+    if ok == 0 {
+        return Err(last_error());
+    }
+
+    Ok(standard.AllocationSize.max(0) as u64)
 }
 
 #[cfg(test)]

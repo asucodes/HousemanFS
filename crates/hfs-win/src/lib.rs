@@ -22,6 +22,6 @@ pub mod volume;
 pub mod walk;
 
 pub use elevation::is_elevated;
-pub use ntfs::{NtfsMetadata, ntfs_metadata};
+pub use ntfs::{NtfsMetadata, SystemFile, mft_allocation, ntfs_metadata, system_files};
 pub use volume::{VolumeInfo, volume_info};
 pub use walk::{EntryKind, ScannedEntry, Walk, WalkOptions, WalkSummary, walk, walk_with};

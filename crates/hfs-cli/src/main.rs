@@ -7,7 +7,9 @@ use std::fmt::Write as _;
 use std::process::ExitCode;
 
 use hfs_core::{Accounting, Denied, Reconciliation, reconcile};
-use hfs_win::{WalkSummary, is_elevated, ntfs_metadata, volume_info, walk};
+use hfs_win::{
+    WalkSummary, is_elevated, mft_allocation, ntfs_metadata, system_files, volume_info, walk,
+};
 
 const USAGE: &str = "\
 housemanfs — read-only filesystem accounting
@@ -260,9 +262,25 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
     let metadata_query = ntfs_metadata(path);
     let metadata = metadata_query.as_ref().ok().and_then(|m| *m);
 
-    let known_metadata = metadata
-        .as_ref()
-        .map(|m| m.mft_bytes.saturating_add(m.usn_journal_max_bytes));
+    // NTFS marks its own system files as metadata and excludes them from directory
+    // enumeration, so a walk never sees them however privileged it is. They have to be
+    // measured by name.
+    let system = system_files(path);
+    let system_total: u64 = system.iter().filter_map(|f| f.allocated).sum();
+    let system_measured = system.iter().filter(|f| f.allocated.is_some()).count();
+    let system_failed = system.len() - system_measured;
+
+    // `$MFT`'s real allocation supersedes the valid-data-length figure from the control code,
+    // which counts only the portion holding live records and so understates the table.
+    let mft = mft_allocation(path).or_else(|| metadata.as_ref().map(|m| m.mft_bytes));
+
+    let known_metadata = if system_measured > 0 || mft.is_some() {
+        Some(mft.unwrap_or(0).saturating_add(system_total))
+    } else {
+        metadata
+            .as_ref()
+            .map(|m| m.mft_bytes.saturating_add(m.usn_journal_max_bytes))
+    };
 
     let accounting = Accounting {
         total: v.total_bytes,
@@ -289,20 +307,9 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
 
     let _ = writeln!(out);
     let _ = writeln!(out, "components of the figure above:");
-    match &metadata {
-        Some(m) => {
-            let _ = writeln!(
-                out,
-                "  master file table     {} — measured",
-                human(m.mft_bytes)
-            );
-            if m.usn_journal_max_bytes > 0 {
-                let _ = writeln!(
-                    out,
-                    "  change journal        {} maximum — measured",
-                    human(m.usn_journal_max_bytes)
-                );
-            }
+    match mft {
+        Some(bytes) => {
+            let _ = writeln!(out, "  master file table     {} — measured", human(bytes));
         }
         None => match &metadata_query {
             Err(err) => {
@@ -315,6 +322,33 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
                 );
             }
         },
+    }
+    if system_measured > 0 {
+        let _ = writeln!(
+            out,
+            "  ntfs system files     {} across {} files — measured",
+            human(system_total),
+            system_measured
+        );
+        if system_failed > 0 {
+            let _ = writeln!(
+                out,
+                "                        {system_failed} could not be opened, so the total is low"
+            );
+        }
+    }
+    // Only shown when it contributed. Once the system files are measured by name the journal is
+    // already inside that total, and listing it again would overstate what was counted.
+    if system_measured == 0 {
+        if let Some(m) = &metadata {
+            if m.usn_journal_max_bytes > 0 {
+                let _ = writeln!(
+                    out,
+                    "  change journal        {} maximum — measured",
+                    human(m.usn_journal_max_bytes)
+                );
+            }
+        }
     }
     let _ = writeln!(
         out,
