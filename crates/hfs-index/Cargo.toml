@@ -1,0 +1,12 @@
+[package]
+name = "hfs-index"
+description = "Persistent index and queries. Derived data, never a source of truth."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hfs-core = { path = "../hfs-core" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
