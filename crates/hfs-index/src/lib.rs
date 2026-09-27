@@ -287,7 +287,7 @@ impl Index {
         }
 
         // Deepest first, so a child's total is complete before its parent consumes it.
-        depths.sort_by(|a, b| b.1.cmp(&a.1));
+        depths.sort_by_key(|a| std::cmp::Reverse(a.1));
 
         let tx = self.conn.transaction()?;
         {
