@@ -11,4 +11,8 @@
 *.hfsdb
 *.hfsindex
 *.hfseval
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 /local/

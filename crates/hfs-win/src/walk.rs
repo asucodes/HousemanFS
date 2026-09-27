@@ -49,11 +49,22 @@ pub enum EntryKind {
     Reparse,
 }
 
-/// One file discovered during a walk.
+/// One entry discovered during a walk.
 #[derive(Debug, Clone)]
 pub struct ScannedEntry {
     pub path: PathBuf,
     pub kind: EntryKind,
+
+    /// Stable identity of the underlying data, when the query succeeded.
+    ///
+    /// Two names for one file share this value, which is how a hardlink group is recognised
+    /// and why the index can count how many names point at the same bytes. `None` means the
+    /// query was refused, which is different from "this entry has no identity" — a caller needs
+    /// to tell those apart rather than treating both as unknown.
+    pub id: Option<[u8; 16]>,
+    /// Identity of the containing directory, so the index can rebuild the tree.
+    pub parent: Option<[u8; 16]>,
+
     /// Bytes the file reports.
     pub logical: u64,
     /// Bytes the file actually occupies.
@@ -142,15 +153,18 @@ pub fn walk(root: &str) -> io::Result<Walk> {
 pub fn walk_with(root: &str, options: WalkOptions) -> io::Result<Walk> {
     let mut summary = WalkSummary::default();
     let mut entries = Vec::new();
-    let mut pending: Vec<PathBuf> = vec![PathBuf::from(root)];
+    // The root's own identity becomes the parent of everything directly beneath it.
+    let root_id = query_file(Path::new(root)).ok().and_then(|f| f.id);
+    let mut pending: Vec<(PathBuf, Option<[u8; 16]>)> = vec![(PathBuf::from(root), root_id)];
 
     // Identity of every hardlink group already counted. Bounded by the number of hardlinked
     // files rather than by the number of files, so it stays small on typical volumes.
     let mut counted_groups: HashSet<[u8; 16]> = HashSet::new();
 
-    while let Some(dir) = pending.pop() {
+    while let Some((dir, id)) = pending.pop() {
         match read_directory(
             &dir,
+            id,
             &options,
             &mut summary,
             &mut entries,
@@ -177,11 +191,12 @@ pub fn walk_with(root: &str, options: WalkOptions) -> io::Result<Walk> {
 /// Read one directory. Returns the subdirectories that should be descended into.
 fn read_directory(
     dir: &Path,
+    parent: Option<[u8; 16]>,
     options: &WalkOptions,
     summary: &mut WalkSummary,
     entries: &mut Vec<ScannedEntry>,
     counted_groups: &mut HashSet<[u8; 16]>,
-) -> io::Result<Vec<PathBuf>> {
+) -> io::Result<Vec<(PathBuf, Option<[u8; 16]>)>> {
     let pattern = format!("{}\\*", dir.display());
     let wide = to_wide(&pattern);
 
@@ -222,6 +237,8 @@ fn read_directory(
                     entries.push(ScannedEntry {
                         path,
                         kind: EntryKind::Reparse,
+                        id: None,
+                        parent,
                         logical,
                         allocated: 0,
                         links: 0,
@@ -230,25 +247,39 @@ fn read_directory(
             } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
                 summary.directories += 1;
 
-                // Ask the directory what it occupies. Its index blocks are allocated outside
-                // the master file table and hold the names it contains, so a walk that only
-                // lists names never sees them. A failure here is not fatal: the directory is
-                // still traversed, it simply contributes no measured overhead.
-                let allocated = query_file(&path).map(|f| f.allocated).unwrap_or(0);
+                // Ask the directory what it occupies and who it is. Its index blocks are
+                // allocated outside the master file table and hold the names it contains, so a
+                // walk that only lists names never sees them. Its identity is needed because
+                // it becomes the parent of everything beneath it. A failure is not fatal: the
+                // directory is still traversed, it simply contributes no measured overhead and
+                // its children are recorded with no parent.
+                let queried = query_file(&path).ok();
+                let allocated = queried.as_ref().map(|f| f.allocated).unwrap_or(0);
+                let id = queried.as_ref().and_then(|f| f.id);
                 summary.directory_bytes += allocated;
 
                 if options.collect_entries {
                     entries.push(ScannedEntry {
                         path: path.clone(),
                         kind: EntryKind::Directory,
+                        id,
+                        parent,
                         logical: 0,
                         allocated,
                         links: 0,
                     });
                 }
-                children.push(path);
+                children.push((path, id));
             } else {
-                record_file(&path, logical, options, summary, entries, counted_groups);
+                record_file(
+                    &path,
+                    logical,
+                    parent,
+                    options,
+                    summary,
+                    entries,
+                    counted_groups,
+                );
             }
         }
 
@@ -268,6 +299,7 @@ fn read_directory(
 fn record_file(
     path: &Path,
     logical: u64,
+    parent: Option<[u8; 16]>,
     options: &WalkOptions,
     summary: &mut WalkSummary,
     entries: &mut Vec<ScannedEntry>,
@@ -319,6 +351,8 @@ fn record_file(
         entries.push(ScannedEntry {
             path: path.to_path_buf(),
             kind: EntryKind::File,
+            id,
+            parent,
             logical,
             allocated,
             links,

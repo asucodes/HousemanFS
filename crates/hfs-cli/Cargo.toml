@@ -13,4 +13,5 @@ path = "src/main.rs"
 
 [dependencies]
 hfs-core = { path = "../hfs-core" }
+hfs-index = { path = "../hfs-index" }
 hfs-win = { path = "../hfs-win" }

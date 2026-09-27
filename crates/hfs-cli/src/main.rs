@@ -3,6 +3,8 @@
 //! Every command in this release is read-only. There is no verb that modifies a volume, and
 //! none is reachable from here.
 
+mod index;
+
 use std::fmt::Write as _;
 use std::process::ExitCode;
 
@@ -17,14 +19,21 @@ housemanfs — read-only filesystem accounting
 usage:
   housemanfs info <path>    volume facts for the volume containing <path>
   housemanfs scan <path>    walk <path> and report what occupies space
+  housemanfs index <path>   scan <path> and store the result for fast queries
+  housemanfs top [n]        largest files in the index (default 20)
+  housemanfs dirs [n]       largest directory subtrees (default 20)
+  housemanfs find <term>    files whose name contains <term>
+  housemanfs ext [n]        occupied space by extension
 
 options:
   --out <file>              write the report to a file instead of stdout
+  --index <file>            index to use (default housemanfs.db)
+  --limit <n>               how many rows to show
 
 Scanning a volume root additionally reconciles the result against what the
 filesystem says is in use, and reports what could not be accounted for.
 
-Both commands are read-only. Nothing here modifies a volume.";
+Every command is read-only. Nothing here modifies a volume.";
 
 /// Tolerance for the residual, as a fraction of volume capacity.
 ///
@@ -37,11 +46,23 @@ fn main() -> ExitCode {
     let mut command: Option<String> = None;
     let mut path: Option<String> = None;
     let mut out_file: Option<String> = None;
+    let mut db = index::DEFAULT_INDEX.to_string();
+    let mut limit: u32 = 20;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--out" => out_file = args.next(),
+            "--index" => {
+                if let Some(value) = args.next() {
+                    db = value;
+                }
+            }
+            "--limit" => {
+                if let Some(value) = args.next() {
+                    limit = value.parse().unwrap_or(limit);
+                }
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -56,10 +77,18 @@ fn main() -> ExitCode {
         }
     }
 
-    let (Some(command), Some(path)) = (command, path) else {
+    let Some(command) = command else {
         println!("{USAGE}");
         return ExitCode::FAILURE;
     };
+    let path = path.unwrap_or_default();
+
+    // Queries are meaningless without a target, and an empty one would otherwise silently
+    // scan or query nothing while reporting success.
+    if matches!(command.as_str(), "info" | "scan" | "index" | "find") && path.is_empty() {
+        eprintln!("error: `{command}` needs an argument");
+        return ExitCode::FAILURE;
+    }
 
     // Validate the output path before doing any work. A whole-volume scan can take minutes, and
     // discovering afterwards that the path was unusable wastes the scan and loses the result.
@@ -79,6 +108,11 @@ fn main() -> ExitCode {
     let result = match command.as_str() {
         "info" => info(&path, &mut out),
         "scan" => scan(&path, &mut out),
+        "index" => index::build(&path, &db, &mut out),
+        "top" => index::top(&db, limit, &mut out),
+        "dirs" => index::dirs(&db, limit, &mut out),
+        "find" => index::search(&db, &path, limit, &mut out),
+        "ext" => index::extensions(&db, limit, &mut out),
         _ => {
             println!("{USAGE}");
             return ExitCode::FAILURE;
@@ -457,7 +491,7 @@ fn is_volume_root(path: &str) -> bool {
 ///
 /// Windows displays binary units but labels them GB/TB, which is why a "500 GB" drive shows as
 /// 465 GB. Labelling them GiB costs nothing and avoids repeating that confusion.
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;

@@ -86,6 +86,7 @@ name = "hfs-cli"
 version = "0.0.0"
 dependencies = [
  "hfs-core",
+ "hfs-index",
  "hfs-win",
 ]
 

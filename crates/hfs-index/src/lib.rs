@@ -137,14 +137,18 @@ impl Index {
             )
             .map(|n| n > 0)?;
 
+        // Read as text and parse rather than reading an integer. SQLite columns are dynamically
+        // typed, so a value written by one build can land as TEXT and another as INTEGER, and
+        // reading it back as a fixed type fails on whichever it is not. Casting in SQL makes the
+        // read work against both.
         let existing: Option<u32> = if has_meta {
             conn.query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
+                "SELECT CAST(value AS TEXT) FROM meta WHERE key = 'schema_version'",
                 [],
-                |row| row.get::<_, i64>(0),
+                |row| row.get::<_, String>(0),
             )
             .optional()?
-            .map(|v: i64| v as u32)
+            .and_then(|raw| raw.parse().ok())
         } else {
             None
         };
@@ -166,7 +170,7 @@ impl Index {
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![SCHEMA_VERSION],
+            params![SCHEMA_VERSION as i64],
         )?;
 
         Ok(Self { conn, path })

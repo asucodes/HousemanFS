@@ -38,8 +38,14 @@ pub struct VolumeInfo {
 }
 
 /// Query a volume by any path on it.
-pub fn volume_info(root: &str) -> io::Result<VolumeInfo> {
-    let wide = to_wide(root);
+pub fn volume_info(mount: &str) -> io::Result<VolumeInfo> {
+    let wide = to_wide(mount);
+
+    // `GetVolumeInformationW` and `GetDiskFreeSpaceW` want the *root* of a volume, not any path
+    // on it — passing a deep path fails with ERROR_INVALID_NAME. The free-space query above
+    // accepts any directory, so it keeps the path exactly as given.
+    let root = drive_root(mount);
+    let root_wide = to_wide(root.as_deref().unwrap_or(mount));
 
     let mut available: u64 = 0;
     let mut total: u64 = 0;
@@ -60,7 +66,7 @@ pub fn volume_info(root: &str) -> io::Result<VolumeInfo> {
     // pointers are for optional outputs the API documents as acceptable to omit.
     let ok = unsafe {
         GetVolumeInformationW(
-            wide.as_ptr(),
+            root_wide.as_ptr(),
             std::ptr::null_mut(),
             0,
             &mut serial,
@@ -80,7 +86,7 @@ pub fn volume_info(root: &str) -> io::Result<VolumeInfo> {
     // SAFETY: as above; out-parameters are valid locals.
     let ok = unsafe {
         GetDiskFreeSpaceW(
-            wide.as_ptr(),
+            root_wide.as_ptr(),
             &mut sectors_per_cluster,
             &mut bytes_per_sector,
             std::ptr::null_mut(),
@@ -95,7 +101,7 @@ pub fn volume_info(root: &str) -> io::Result<VolumeInfo> {
     let filesystem = from_wide(&fs_name);
 
     Ok(VolumeInfo {
-        root: root.to_string(),
+        root: mount.to_string(),
         volume_id: derive_volume_id(serial, cluster_bytes, total),
         filesystem,
         serial,
@@ -104,6 +110,20 @@ pub fn volume_info(root: &str) -> io::Result<VolumeInfo> {
         available_bytes: available,
         cluster_bytes,
     })
+}
+
+/// The volume root for a path, e.g. `C:\` for `C:\Users\foo`.
+///
+/// `None` for anything that does not start with a drive letter, such as a UNC path. Callers
+/// fall back to using the path as given, which will fail for the calls that need a root — and
+/// failing loudly is better than silently guessing at a volume.
+fn drive_root(mount: &str) -> Option<String> {
+    let bytes = mount.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        Some(format!("{}:\\", mount[..1].to_ascii_uppercase()))
+    } else {
+        None
+    }
 }
 
 /// Build a stable 16-byte identifier from properties that survive a remount.
@@ -138,6 +158,16 @@ mod tests {
         let c = derive_volume_id(1, 65536, 100);
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn drive_root_is_derived_from_any_path_on_the_volume() {
+        // The two volume-level queries reject a deep path, so the root has to be recovered
+        // from whatever the caller passed.
+        assert_eq!(drive_root(r"C:\"), Some("C:\\".to_string()));
+        assert_eq!(drive_root(r"C:\Users\foo\bar"), Some("C:\\".to_string()));
+        assert_eq!(drive_root(r"c:\deep"), Some("C:\\".to_string()));
+        assert_eq!(drive_root(r"\\server\share\x"), None);
     }
 
     #[test]
