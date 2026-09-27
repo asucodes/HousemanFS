@@ -1,0 +1,13 @@
+[package]
+name = "hfs-tui"
+description = "The finder interface. Renders; decides nothing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crossterm = "0.29.0"
+hfs-index = { path = "../hfs-index" }
+ratatui = "0.29.0"

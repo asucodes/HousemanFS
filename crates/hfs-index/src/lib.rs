@@ -319,6 +319,22 @@ impl Index {
         Ok(())
     }
 
+    /// A fact recorded about the scan, such as the volume root or filesystem name.
+    ///
+    /// Read as text and parsed by the caller, because the value's SQLite type depends on what
+    /// wrote it rather than on what it means.
+    pub fn meta(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT CAST(value AS TEXT) FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
     pub fn summary(&self) -> rusqlite::Result<Summary> {
         let files = self
             .conn

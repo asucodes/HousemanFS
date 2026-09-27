@@ -17,6 +17,7 @@ const USAGE: &str = "\
 housemanfs — read-only filesystem accounting
 
 usage:
+  housemanfs                the finder (needs an index; see below)
   housemanfs info <path>    volume facts for the volume containing <path>
   housemanfs scan <path>    walk <path> and report what occupies space
   housemanfs index <path>   scan <path> and store the result for fast queries
@@ -77,10 +78,9 @@ fn main() -> ExitCode {
         }
     }
 
-    let Some(command) = command else {
-        println!("{USAGE}");
-        return ExitCode::FAILURE;
-    };
+    // No arguments means the finder, not a wall of usage text. It is the thing a returning user
+    // most likely wants, and `--help` is there for anyone who wants the rest.
+    let command = command.unwrap_or_else(|| "finder".to_string());
     let path = path.unwrap_or_default();
 
     // Queries are meaningless without a target, and an empty one would otherwise silently
@@ -113,6 +113,17 @@ fn main() -> ExitCode {
         "dirs" => index::dirs(&db, limit, &mut out),
         "find" => index::search(&db, &path, limit, &mut out),
         "ext" => index::extensions(&db, limit, &mut out),
+        "finder" | "ui" => {
+            // The finder takes over the terminal, so it cannot also write into the report
+            // buffer. It is dispatched before any output is produced.
+            return match hfs_tui::run(&db) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         _ => {
             println!("{USAGE}");
             return ExitCode::FAILURE;
