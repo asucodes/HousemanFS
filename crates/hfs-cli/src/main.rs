@@ -10,7 +10,8 @@ use std::process::ExitCode;
 
 use hfs_core::{Accounting, Denied, Reconciliation, reconcile};
 use hfs_win::{
-    WalkSummary, is_elevated, mft_allocation, ntfs_metadata, system_files, volume_info, walk,
+    BackupPrivilege, WalkSummary, enable_backup_privilege, is_elevated, mft_allocation,
+    ntfs_metadata, system_files, volume_info, walk,
 };
 
 const USAGE: &str = "\
@@ -184,17 +185,29 @@ fn info(path: &str, out: &mut String) -> Result<(), String> {
 }
 
 fn scan(path: &str, out: &mut String) -> Result<(), String> {
+    // Ask for the backup privilege before touching the volume. It is what allows the scan to
+    // open files that refuse even an administrator — SYSTEM-owned files, and directories held
+    // open by a service. Asking is not the same as having it, so the outcome is reported
+    // rather than assumed.
+    let backup = enable_backup_privilege();
+
     let result = walk(path).map_err(|e| e.to_string())?;
     let s = &result.summary;
 
     let _ = writeln!(out, "scanned     {path}");
     let _ = writeln!(
         out,
-        "privilege   {}",
+        "privilege   {}{}",
         if is_elevated() {
             "elevated"
         } else {
             "standard user"
+        },
+        match backup {
+            BackupPrivilege::Enabled => ", backup privilege enabled",
+            BackupPrivilege::AlreadyEnabled => ", backup privilege already held",
+            BackupPrivilege::NotHeld => ", no backup privilege",
+            BackupPrivilege::Failed => ", backup privilege refused",
         }
     );
     let _ = writeln!(out);

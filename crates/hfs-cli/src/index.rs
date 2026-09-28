@@ -17,10 +17,20 @@ pub const DEFAULT_INDEX: &str = "housemanfs.db";
 
 /// Scan `path` and store the result, replacing whatever was there.
 pub fn build(path: &str, db: &str, out: &mut String) -> Result<(), String> {
+    // Same as a scan: ask for the backup privilege, so protected files are measured rather
+    // than estimated from what the directory entry claims.
+    let backup = hfs_win::enable_backup_privilege();
+
     let volume = volume_info(path).map_err(|e| e.to_string())?;
 
     let _ = writeln!(out, "scanning    {path}");
     let _ = writeln!(out, "index       {db}");
+    if !backup.is_active() {
+        let _ = writeln!(
+            out,
+            "privilege   no backup privilege — protected files are sized by report, not allocation"
+        );
+    }
 
     let result = walk_with(
         path,
