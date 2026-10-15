@@ -651,7 +651,7 @@ fn format_age(modified: i64) -> String {
 ///
 /// Full precision matters: truncating to whole seconds would leave the clock up to a second
 /// behind a file written "now", and every fresh file would read as modified in the future.
-fn windows_ticks_now() -> i64 {
+pub(crate) fn windows_ticks_now() -> i64 {
     const UNIX_TO_WINDOWS_TICKS: u128 = 11_644_473_600 * 10_000_000;
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -741,8 +741,8 @@ pub(crate) fn plural(count: u64, singular: &'static str, plural: &'static str) -
 /// Answer a structured question over the index.
 ///
 /// The query language is small and deterministic: size, extension, name, age, sharing and
-/// streams, in any order. It is pattern matching, not understanding — `ask "old isos"`
-/// works because `old` and `isos` are known words, not because anything comprehended the
+/// streams, in any order. It is pattern matching, not understanding — ask "old isos"
+/// works because "old" and "isos" are known words, not because anything comprehended the
 /// sentence. A future language-model frontend would compile into [`AskQuery`], which bounds
 /// what it can express; until then, this parser is the whole of "ask".
 pub fn ask(db: &str, raw: &str, out: &mut String) -> Result<(), String> {
@@ -853,6 +853,181 @@ fn parse_ask(raw: &str) -> Result<hfs_index::AskQuery, String> {
     }
     Ok(query)
 }
+/// Judge the largest indexed files: per-file factors plus versioned rules.
+///
+/// Each suggestion names its rule, its confidence and the measured facts behind it; below
+/// the threshold the tool says nothing, and says so. This is judgment with evidence, not
+/// optimization: nothing here acts, and the verbs are candidates, not instructions.
+pub fn suggest(
+    db: &str,
+    limit: u32,
+    threshold: Option<&str>,
+    without: Option<&str>,
+    min_bytes: Option<&str>,
+    out: &mut String,
+) -> Result<(), String> {
+    use hfs_model::{Engine, FileState, HeuristicEngine, RuleConfig, suggest};
+
+    let config = RuleConfig {
+        min_confidence: match threshold {
+            None => RuleConfig::default().min_confidence,
+            Some(raw) => raw
+                .parse::<f64>()
+                .map_err(|_| format!("don't understand {raw:?} as a confidence; try 0.5"))?,
+        },
+        min_bytes: match min_bytes {
+            None => RuleConfig::default().min_bytes,
+            Some(raw) => parse_size(raw)
+                .ok_or_else(|| format!("don't understand {raw:?} as a size; try 1GB"))?,
+        },
+        without: without
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|rule| !rule.is_empty())
+            .map(str::to_string)
+            .collect(),
+    };
+
+    let index = open(db)?;
+    let total = index.summary().map_err(|e| e.to_string())?.files;
+    let hits = index.largest_files(limit).map_err(|e| e.to_string())?;
+    let engine = HeuristicEngine;
+    let now = windows_ticks_now();
+
+    let _ = writeln!(
+        out,
+        "judging     {} of {} indexed files with heuristic-v1, confidence >= {}%",
+        hits.len(),
+        total,
+        (config.min_confidence * 100.0) as u32
+    );
+    let _ = writeln!(out);
+
+    let mut shown = 0;
+    for hit in &hits {
+        let (name, directory) = split_name(&hit.path);
+        let state = FileState::assemble(
+            &name,
+            hit.logical,
+            hit.allocated,
+            hit.stream_bytes,
+            hit.stream_count,
+            hit.links,
+            hit.provenance,
+        )
+        .with_location(&directory, hit.modified);
+        let output = engine.ask(&state, now);
+        let suggestions = suggest(&state, &output, now, &config);
+        if suggestions.is_empty() {
+            continue;
+        }
+        shown += 1;
+        let _ = writeln!(out, "{}  {}", human(hit.allocated), truncate(&hit.path, 90));
+        for suggestion in &suggestions {
+            let _ = writeln!(
+                out,
+                "  {} v{} ({}%): {} — {}",
+                suggestion.rule,
+                suggestion.rule_version,
+                (suggestion.confidence * 100.0) as u32,
+                suggestion.kind.verb(),
+                evidence(&suggestion.kind, hit.modified),
+            );
+        }
+    }
+
+    if shown == 0 {
+        let _ = writeln!(
+            out,
+            "no suggestions above the gate. Silence is the correct output when nothing \
+             clears it."
+        );
+    }
+    Ok(())
+}
+
+/// The measured facts one suggestion stands on, in words.
+fn evidence(kind: &hfs_model::SuggestionKind, modified: i64) -> String {
+    use hfs_model::SuggestionKind;
+    match kind {
+        SuggestionKind::StaleArchive { allocated, .. } => format!(
+            "occupies {}, last written {}",
+            human(*allocated),
+            format_age(modified)
+        ),
+        SuggestionKind::BuildOutput { allocated } => {
+            format!("occupies {}, regenerable by rebuilding", human(*allocated))
+        }
+        SuggestionKind::SparseMisranked { logical, allocated } => {
+            format!(
+                "reports {}, occupies {}",
+                human(*logical),
+                human(*allocated)
+            )
+        }
+        SuggestionKind::StreamHeavy {
+            stream_bytes,
+            stream_count,
+        } => format!(
+            "{} across {} named {} the listing never shows",
+            human(*stream_bytes),
+            stream_count,
+            plural(u64::from(*stream_count), "stream", "streams"),
+        ),
+        SuggestionKind::SharedNames { links, allocated } => format!(
+            "{} names share {}, removing one frees nothing",
+            links,
+            human(*allocated)
+        ),
+    }
+}
+
+/// Split a full path into its file name and parent directory name. The model gets names,
+/// not identities: enough context to judge, nothing to memorise.
+fn split_name(path: &str) -> (String, String) {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    let mut parts = trimmed.rsplit(['\\', '/']);
+    let name = parts.next().unwrap_or("").to_string();
+    let directory = parts.next().unwrap_or("").to_string();
+    // A file on a volume root has `C:` as its parent; the drive letter is not a directory
+    // in any sense the rules care about.
+    let directory = if directory.len() == 2 && directory.as_bytes()[1] == b':' {
+        String::new()
+    } else {
+        directory
+    };
+    (name, directory)
+}
+
+/// Run the committed evaluation set and report the score.
+///
+/// The same set the test suite enforces, printed for humans: what was expected and where
+/// they differ. A nonzero failure count fails the command, so CI can run the tool
+/// against itself.
+pub fn eval(out: &mut String) -> Result<(), String> {
+    use hfs_model::{EVAL_CASES, RuleConfig, eval_engine, run_eval};
+
+    let report = run_eval(&eval_engine(), &RuleConfig::default());
+    let _ = writeln!(
+        out,
+        "evaluation heuristic-v1 vs {} committed cases",
+        EVAL_CASES.len()
+    );
+    let _ = writeln!(out);
+    if report.failures.is_empty() {
+        let _ = writeln!(out, "{} passed, 0 failed", report.passed);
+        Ok(())
+    } else {
+        for failure in &report.failures {
+            let _ = writeln!(out, " FAIL {failure}");
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{} passed, {} failed", report.passed, report.failed);
+        Err(format!("{} evaluation cases failed", report.failed))
+    }
+}
+
 /// Totals by extension.
 pub fn extensions(db: &str, limit: u32, out: &mut String) -> Result<(), String> {
     let index = open(db)?;

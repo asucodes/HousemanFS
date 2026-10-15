@@ -14,18 +14,19 @@
 //! ```
 //!
 //! This crate owns everything left of the arrow: what the model is asked ([`questions`]),
-//! what it is told ([`state`]), and what an engine must return ([`engine`]). Deterministic
-//! rules combine the factors into suggestions elsewhere, in code that can be read and tested.
-//! A suggestion is emitted only when confidence clears a threshold; otherwise the tool says
-//! nothing.
+//! what it is told ([`state`]), what an engine must return ([`engine`]), and how factors
+//! become suggestions ([`rules`]). Deterministic rules combine the factors in code that can
+//! be read, switched off and tested. A suggestion is emitted only when confidence clears a
+//! threshold; otherwise the tool says nothing.
 //!
-//! # Status: scaffold
+//! # Status: rules with a baseline engine
 //!
-//! The boundary exists and is tested, but no engine is wired yet. [`StubEngine`] stands in:
-//! it returns maximum uncertainty for every question, which is the honest floor any real
-//! engine must rise above. Selecting the engine (D4 names Laya, behind this crate's
-//! abstraction so it can be replaced) and writing the combination rules is Phase 2 work.
-//! Nothing here touches the disk, the index, or the interface — those seams are load-bearing.
+//! The combination rules exist and are measured against a committed evaluation set. The
+//! engine answering the factors is [`HeuristicEngine`]: transparent fixed heuristics,
+//! labelled as uncalibrated, standing in for the learned decision model D4 describes.
+//! Selecting that engine and calibrating it is the remaining Phase 2 work; the rules will
+//! not care, because they read factors, not engines. Nothing here touches the disk, the
+//! index, or the interface — those seams are load-bearing.
 //!
 //! Rules for this crate, matching the rest of the workspace:
 //!
@@ -36,9 +37,15 @@
 #![forbid(unsafe_code)]
 
 pub mod engine;
+pub mod eval;
 pub mod questions;
+pub mod rules;
 pub mod state;
 
-pub use engine::{Engine, FactorScores, ModelOutput, StubEngine, meets_threshold, top_choice};
+pub use engine::{
+    Engine, FactorScores, HeuristicEngine, ModelOutput, StubEngine, meets_threshold, top_choice,
+};
+pub use eval::{EVAL_CASES, EVAL_NOW, EvalCase, EvalReport, eval_engine, run_eval};
 pub use questions::{QUESTION_SET_VERSION, QUESTIONS, QuestionDef};
+pub use rules::{RULES, RuleConfig, Suggestion, SuggestionKind, suggest};
 pub use state::FileState;

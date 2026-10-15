@@ -26,8 +26,10 @@ usage:
   housemanfs top [n]        largest files in the index (default 20)
   housemanfs dirs [n]       largest directory subtrees (default 20)
   housemanfs find <term>    files whose name contains <term>
-  housemanfs ask \"<query>\" structured questions: size>500MB ext:iso older than 1y
+  housemanfs ask QUERY      structured questions: size>500MB ext:iso older than 1y
                   shared streams name:backup videos limit 10
+  housemanfs suggest      judgment over the largest indexed files, with evidence
+  housemanfs eval           run the committed evaluation set
   housemanfs ext [n]        occupied space by extension
   housemanfs explain <path> the measurement behind one indexed path
   housemanfs export         the index as versioned JSON (see --out)
@@ -36,6 +38,9 @@ options:
   --out <file>              write the report to a file instead of stdout
   --index <file>            index to use (default housemanfs.db)
   --limit <n>               how many rows to show
+  --threshold <p>           minimum confidence for a suggestion (default 0.5)
+  --without <rules>         switch rules off, e.g. R1,R3
+  --min-bytes <size>        smallest file a suggestion considers (default 1GB)
 
 Scanning a volume root additionally reconciles the result against what the
 filesystem says is in use, and reports what could not be accounted for.
@@ -55,6 +60,9 @@ fn main() -> ExitCode {
     let mut out_file: Option<String> = None;
     let mut db = index::DEFAULT_INDEX.to_string();
     let mut limit: u32 = 20;
+    let mut threshold: Option<String> = None;
+    let mut without: Option<String> = None;
+    let mut min_bytes: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -70,6 +78,9 @@ fn main() -> ExitCode {
                     limit = value.parse().unwrap_or(limit);
                 }
             }
+            "--threshold" => threshold = args.next(),
+            "--without" => without = args.next(),
+            "--min-bytes" => min_bytes = args.next(),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -124,6 +135,15 @@ fn main() -> ExitCode {
         "dirs" => index::dirs(&db, limit, &mut out),
         "find" => index::search(&db, &path, limit, &mut out),
         "ask" => index::ask(&db, &path, &mut out),
+        "suggest" => index::suggest(
+            &db,
+            limit,
+            threshold.as_deref(),
+            without.as_deref(),
+            min_bytes.as_deref(),
+            &mut out,
+        ),
+        "eval" => index::eval(&mut out),
         "ext" => index::extensions(&db, limit, &mut out),
         "explain" => index::explain(&db, &path, &mut out),
         "export" => index::export(&db, limit, &mut out),

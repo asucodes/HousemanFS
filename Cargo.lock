@@ -291,6 +291,7 @@ version = "0.0.0"
 dependencies = [
  "hfs-core",
  "hfs-index",
+ "hfs-model",
  "hfs-tui",
  "hfs-win",
  "serde_json",
