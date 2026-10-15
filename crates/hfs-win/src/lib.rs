@@ -27,5 +27,6 @@ pub use ntfs::{NtfsMetadata, SystemFile, mft_allocation, ntfs_metadata, system_f
 pub use privilege::{BackupPrivilege, enable_backup_privilege, holds_backup_privilege};
 pub use volume::{VolumeInfo, volume_info};
 pub use walk::{
-    EntryKind, PathFacts, ScannedEntry, Walk, WalkOptions, WalkSummary, path_facts, walk, walk_with,
+    EntryKind, PathFacts, ScannedEntry, Walk, WalkControl, WalkOptions, WalkSummary, path_facts,
+    walk, walk_with, walk_with_control,
 };

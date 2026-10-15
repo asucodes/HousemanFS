@@ -21,6 +21,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -182,6 +183,34 @@ pub struct WalkOptions {
 pub struct Walk {
     pub summary: WalkSummary,
     pub entries: Vec<ScannedEntry>,
+    /// True when cancellation stopped the walk early. The summary and entries cover only
+    /// what was scanned; nothing about the remainder is claimed.
+    pub cancelled: bool,
+}
+
+/// Progress reporting and cancellation for a walk.
+///
+/// A terminal command can block until the walk finishes; an interface cannot. The control
+/// lets a caller report progress and stop early, without changing what a walk measures.
+pub struct WalkControl<'a> {
+    /// Called with (files, directories) scanned so far, each time the file count crosses
+    /// another multiple of `every_files`.
+    pub progress: Option<&'a mut dyn FnMut(u64, u64)>,
+    /// Progress granularity in files. 0 disables reporting.
+    pub every_files: u64,
+    /// When set, the walk stops at the next directory boundary and returns what it has,
+    /// with `cancelled` set. Stopping is observable, never silent.
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+impl Default for WalkControl<'_> {
+    fn default() -> Self {
+        Self {
+            progress: None,
+            every_files: 0,
+            cancel: None,
+        }
+    }
 }
 
 /// Walk `root` and everything beneath it, without following reparse points.
@@ -219,6 +248,15 @@ pub fn path_facts(path: &str) -> io::Result<PathFacts> {
 
 /// Walk with explicit options.
 pub fn walk_with(root: &str, options: WalkOptions) -> io::Result<Walk> {
+    walk_with_control(root, options, &mut WalkControl::default())
+}
+
+/// Walk with progress reporting and cancellation.
+pub fn walk_with_control(
+    root: &str,
+    options: WalkOptions,
+    control: &mut WalkControl,
+) -> io::Result<Walk> {
     // The walk joins paths with the native separator, so a root spelled with forward
     // slashes would produce mixed `C:/Windows\...` paths all the way down. Normalise once,
     // up front, so every path the walk reports is spelled one way.
@@ -247,6 +285,8 @@ pub fn walk_with(root: &str, options: WalkOptions) -> io::Result<Walk> {
     // Identity of every hardlink group already counted. Bounded by the number of hardlinked
     // files rather than by the number of files, so it stays small on typical volumes.
     let mut counted_groups: HashSet<[u8; 16]> = HashSet::new();
+    let mut cancelled = false;
+    let mut next_tick = control.every_files;
 
     while let Some(Pending {
         path: dir,
@@ -301,9 +341,30 @@ pub fn walk_with(root: &str, options: WalkOptions) -> io::Result<Walk> {
                 }
             }
         }
+
+        // Progress and cancellation are checked per directory: often enough for a lively
+        // progress bar, seldom enough to cost nothing measurable.
+        if control.every_files > 0 && summary.files >= next_tick {
+            next_tick = summary.files + control.every_files;
+            if let Some(report) = control.progress.as_mut() {
+                report(summary.files, summary.directories);
+            }
+        }
+        if control
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            cancelled = true;
+            break;
+        }
     }
 
-    Ok(Walk { summary, entries })
+    Ok(Walk {
+        summary,
+        entries,
+        cancelled,
+    })
 }
 
 /// Read one directory. Returns the subdirectories that should be descended into.

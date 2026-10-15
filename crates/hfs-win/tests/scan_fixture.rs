@@ -111,3 +111,67 @@ fn fixture_tree_is_accounted_exactly_once() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn progress_reports_and_cancellation_stops() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = std::env::temp_dir().join(format!("hfs-progress-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // Files live in subdirectories, never at the root: the root listing alone measures
+    // nothing, so a walk cancelled up front must report zero files.
+    for sub in 0..4 {
+        let subdir = dir.join(format!("sub{sub}"));
+        std::fs::create_dir_all(&subdir).expect("fixture dir");
+        for i in 0..4 {
+            std::fs::write(subdir.join(format!("f{i}.bin")), vec![i as u8; 5_000])
+                .expect("fixture file");
+        }
+    }
+    const TOTAL: u64 = 16;
+
+    // Progress fires with non-decreasing counts and ends at the true totals.
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    let mut control = hfs_win::WalkControl {
+        progress: Some(&mut |files, dirs| seen.push((files, dirs))),
+        every_files: 1,
+        cancel: None,
+    };
+    let walk = hfs_win::walk_with_control(
+        &dir.display().to_string(),
+        WalkOptions {
+            collect_entries: false,
+        },
+        &mut control,
+    )
+    .expect("fixture walks");
+    assert!(!walk.cancelled);
+    assert!(!seen.is_empty(), "progress reported at least once");
+    let &(last_files, _) = seen.last().unwrap();
+    assert_eq!(last_files, walk.summary.files);
+    assert_eq!(walk.summary.files, TOTAL);
+
+    // A set flag stops the walk before it measures anything.
+    let cancel = AtomicBool::new(true);
+    let mut control = hfs_win::WalkControl {
+        progress: None,
+        every_files: 0,
+        cancel: Some(&cancel),
+    };
+    let walk = hfs_win::walk_with_control(
+        &dir.display().to_string(),
+        WalkOptions {
+            collect_entries: false,
+        },
+        &mut control,
+    )
+    .expect("cancellation still returns what exists");
+    assert!(walk.cancelled, "a set flag must stop the walk");
+    assert_eq!(
+        walk.summary.files, 0,
+        "only the root listing ran, and it holds no files"
+    );
+    let _ = cancel.load(Ordering::Relaxed);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
