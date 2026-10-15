@@ -297,7 +297,7 @@ pub fn explain(db: &str, path: &str, out: &mut String) -> Result<(), String> {
             );
         }
     }
-    let _ = writeln!(out, "measured by {}", provenance_text(record.provenance));
+    let _ = writeln!(out, "measured by {}", record.provenance.describe());
     let _ = writeln!(out);
     let _ = writeln!(
         out,
@@ -401,25 +401,6 @@ pub fn export(db: &str, limit: u32, out: &mut String) -> Result<(), String> {
     out.push_str(&serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?);
     out.push('\n');
     Ok(())
-}
-
-/// What a provenance code means, in the words `explain` shows.
-fn provenance_text(provenance: FileProvenance) -> &'static str {
-    match provenance {
-        FileProvenance::Full => "allocation, identity and streams",
-        FileProvenance::NoIdentity => {
-            "allocation and streams; identity unavailable, so hardlink grouping may overcount"
-        }
-        FileProvenance::NoStreams => {
-            "allocation and identity; streams never enumerated, so the stream figure is unknown"
-        }
-        FileProvenance::Denied => {
-            "nothing — the entry could not be opened, and its size is the directory's report"
-        }
-        FileProvenance::Unknown => {
-            "an unknown combination — indexed before provenance was recorded; treat as approximate"
-        }
-    }
 }
 
 /// One line about named streams, printed only when there is something to say.
@@ -708,7 +689,7 @@ pub fn suggest(
                 suggestion.rule_version,
                 (suggestion.confidence * 100.0) as u32,
                 suggestion.kind.verb(),
-                evidence(&suggestion.kind, hit.modified),
+                evidence(&suggestion.kind),
             );
         }
     }
@@ -723,40 +704,14 @@ pub fn suggest(
     Ok(())
 }
 
-/// The measured facts one suggestion stands on, in words.
-fn evidence(kind: &hfs_model::SuggestionKind, modified: i64) -> String {
-    use hfs_model::SuggestionKind;
-    match kind {
-        SuggestionKind::StaleArchive { allocated, .. } => format!(
-            "occupies {}, last written {}",
-            human(*allocated),
-            human_age(modified, windows_ticks_now())
-        ),
-        SuggestionKind::BuildOutput { allocated } => {
-            format!("occupies {}, regenerable by rebuilding", human(*allocated))
-        }
-        SuggestionKind::SparseMisranked { logical, allocated } => {
-            format!(
-                "reports {}, occupies {}",
-                human(*logical),
-                human(*allocated)
-            )
-        }
-        SuggestionKind::StreamHeavy {
-            stream_bytes,
-            stream_count,
-        } => format!(
-            "{} across {} named {} the listing never shows",
-            human(*stream_bytes),
-            stream_count,
-            plural(u64::from(*stream_count), "stream", "streams"),
-        ),
-        SuggestionKind::SharedNames { links, allocated } => format!(
-            "{} names share {}, removing one frees nothing",
-            links,
-            human(*allocated)
-        ),
-    }
+/// The measured facts one suggestion stands on, in words: the shared evidence pairs
+/// joined into the CLI's one-line rendering.
+fn evidence(kind: &hfs_model::SuggestionKind) -> String {
+    kind.evidence()
+        .iter()
+        .map(|(label, value)| format!("{label} {value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Split a full path into its file name and parent directory name. The model gets names,

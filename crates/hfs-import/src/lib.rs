@@ -18,11 +18,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use hfs_core::FileProvenance;
+use hfs_core::{Accounting, Denied, FileProvenance, RESIDUAL_TOLERANCE, Reconciliation, reconcile};
 use hfs_index::{DirRow, FileRow, ScanMetadata, extension_of};
 use hfs_win::{
-    BackupPrivilege, EntryKind, WalkControl, WalkOptions, WalkSummary, enable_backup_privilege,
-    is_elevated, path_facts, volume_info, walk_with_control,
+    BackupPrivilege, EntryKind, NtfsMetadata, VolumeInfo, WalkControl, WalkOptions, WalkSummary,
+    enable_backup_privilege, is_elevated, mft_allocation, ntfs_metadata, path_facts, system_files,
+    volume_info, walk_with_control,
 };
 
 /// One walk, converted to index rows and scan facts.
@@ -213,6 +214,90 @@ pub fn scan_path(path: &str, control: &mut WalkControl) -> Result<ConvertedScan,
         meta,
         summary: result.summary,
         backup,
+    })
+}
+
+/// What a volume reconciliation found, beyond the bare residual.
+pub struct VolumeAccounting {
+    pub volume: VolumeInfo,
+    pub accounting: Accounting,
+    pub reconciliation: Reconciliation,
+    /// The master file table's real allocation, when it could be measured.
+    pub mft_bytes: Option<u64>,
+    pub system_bytes: u64,
+    pub system_measured: usize,
+    pub system_failed: usize,
+    /// Filesystem bookkeeping (MFT size, journal size) when the query succeeded.
+    pub metadata: Option<NtfsMetadata>,
+    /// Why the bookkeeping query failed, when it did. `None` with `metadata` also `None`
+    /// means the filesystem simply has nothing to report, not that anyone refused.
+    pub metadata_error: Option<String>,
+}
+
+/// Compare what a walk attributed against what the filesystem says is in use.
+///
+/// The residual is computed, not hidden: every frontend reports it with the same tolerance
+/// and the same components, so the finding reads identically in the terminal and on
+/// screen. See [`RESIDUAL_TOLERANCE`] for what the tolerance means and when it moves.
+pub fn account_volume(path: &str, s: &WalkSummary) -> Result<VolumeAccounting, String> {
+    let volume = volume_info(path).map_err(|e| e.to_string())?;
+
+    // NTFS keeps its own bookkeeping — the master file table, the change journal — which a
+    // directory walk cannot see and which occupies real space. Querying it needs a handle to
+    // the volume, and therefore administrator rights. Without them this returns `None` and the
+    // residual absorbs the difference.
+    // The reason matters as much as the absence. "Not available on this filesystem" and "the
+    // query was refused" look identical if only the missing value is reported, and that
+    // ambiguity once hid a real bug: an elevated scan reported its metadata as unmeasured.
+    let metadata_query = ntfs_metadata(path);
+    let metadata_error = metadata_query.as_ref().err().map(|e| e.to_string());
+    let metadata = metadata_query.ok().flatten();
+
+    // NTFS marks its own system files as metadata and excludes them from directory
+    // enumeration, so a walk never sees them however privileged it is. They have to be
+    // measured by name.
+    let system = system_files(path);
+    let system_bytes: u64 = system.iter().filter_map(|f| f.allocated).sum();
+    let system_measured = system.iter().filter(|f| f.allocated.is_some()).count();
+    let system_failed = system.len() - system_measured;
+
+    // `$MFT`'s real allocation supersedes the valid-data-length figure from the control code,
+    // which counts only the portion holding live records and so understates the table.
+    let mft_bytes = mft_allocation(path).or_else(|| metadata.as_ref().map(|m| m.mft_bytes));
+
+    let known_metadata = if system_measured > 0 || mft_bytes.is_some() {
+        Some(mft_bytes.unwrap_or(0).saturating_add(system_bytes))
+    } else {
+        metadata
+            .as_ref()
+            .map(|m| m.mft_bytes.saturating_add(m.usn_journal_max_bytes))
+    };
+
+    let accounting = Accounting {
+        total: volume.total_bytes,
+        free: volume.free_bytes,
+        file_bytes: s.allocated_bytes,
+        // Named streams are measured on allocation, on the same handle that measures the
+        // main data. Files whose streams could not be enumerated stay out of this figure, so
+        // the residual carries their unknown part honestly rather than being flattered by a
+        // zero.
+        stream_bytes: s.stream_bytes,
+        directory_bytes: s.directory_bytes,
+        known_metadata,
+        denied: Denied::new(s.denied_directories.saturating_add(s.denied_files)),
+    };
+    let reconciliation = reconcile(&accounting, RESIDUAL_TOLERANCE);
+
+    Ok(VolumeAccounting {
+        volume,
+        accounting,
+        reconciliation,
+        mft_bytes,
+        system_bytes,
+        system_measured,
+        system_failed,
+        metadata,
+        metadata_error,
     })
 }
 

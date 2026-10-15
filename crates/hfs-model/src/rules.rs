@@ -81,6 +81,51 @@ impl SuggestionKind {
             Self::SharedNames { .. } => "shared names: removing one frees nothing",
         }
     }
+
+    /// The measured facts the suggestion stands on, as label/value pairs.
+    ///
+    /// Lives here so every frontend renders the same evidence: the CLI joins the pairs
+    /// into one line, richer interfaces lay them out as rows. Values are pre-formatted
+    /// with the shared byte spellings; labels are stable strings, not sentences.
+    pub fn evidence(&self) -> Vec<(&'static str, String)> {
+        use hfs_core::format::human_bytes_exact;
+        match self {
+            Self::StaleArchive {
+                allocated,
+                age_days,
+            } => vec![
+                ("occupies", human_bytes_exact(*allocated)),
+                ("last written", format!("{age_days} days ago")),
+            ],
+            Self::BuildOutput { allocated } => vec![
+                ("occupies", human_bytes_exact(*allocated)),
+                ("note", "regenerable by rebuilding".to_string()),
+            ],
+            Self::SparseMisranked { logical, allocated } => vec![
+                ("reports", human_bytes_exact(*logical)),
+                ("occupies", human_bytes_exact(*allocated)),
+            ],
+            Self::StreamHeavy {
+                stream_bytes,
+                stream_count,
+            } => vec![(
+                "streams",
+                format!(
+                    "{} across {stream_count} named {}",
+                    human_bytes_exact(*stream_bytes),
+                    if *stream_count == 1 {
+                        "stream"
+                    } else {
+                        "streams"
+                    },
+                ),
+            )],
+            Self::SharedNames { links, allocated } => vec![
+                ("names", links.to_string()),
+                ("occupies", human_bytes_exact(*allocated)),
+            ],
+        }
+    }
 }
 
 /// One suggestion: what, how confident, and by which rule.

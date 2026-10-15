@@ -8,10 +8,10 @@ mod index;
 use std::fmt::Write as _;
 use std::process::ExitCode;
 
-use hfs_core::{Accounting, Denied, Reconciliation, human_bytes_exact as human, reconcile};
+use hfs_core::{RESIDUAL_TOLERANCE, Reconciliation, human_bytes_exact as human};
 use hfs_win::{
     BackupPrivilege, WalkSummary, enable_backup_privilege, holds_backup_privilege, is_elevated,
-    mft_allocation, ntfs_metadata, system_files, volume_info, walk,
+    volume_info, walk,
 };
 
 const USAGE: &str = "\
@@ -46,13 +46,6 @@ Scanning a volume root additionally reconciles the result against what the
 filesystem says is in use, and reports what could not be accounted for.
 
 Every command is read-only. Nothing here modifies a volume.";
-
-/// Tolerance for the residual, as a fraction of volume capacity.
-///
-/// Not zero, because a real volume always holds things a directory walk cannot see: filesystem
-/// metadata, alternate data streams, and paths the caller may not read. The point is not to
-/// eliminate the residual but to keep it small and to explain it.
-const RESIDUAL_TOLERANCE: f64 = 0.02;
 
 fn main() -> ExitCode {
     let mut command: Option<String> = None;
@@ -381,51 +374,10 @@ fn scan(path: &str, out: &mut String) -> Result<(), String> {
 /// not trustworthy; one that names the gap and its likely causes is telling the truth, and the
 /// truth is checkable.
 fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(), String> {
-    let v = volume_info(path).map_err(|e| e.to_string())?;
-
-    // NTFS keeps its own bookkeeping — the master file table, the change journal — which a
-    // directory walk cannot see and which occupies real space. Querying it needs a handle to
-    // the volume, and therefore administrator rights. Without them this returns `None` and the
-    // residual absorbs the difference, which is exactly what the privilege line warns about.
-    // The reason matters as much as the absence. "Not available on this filesystem" and "the
-    // query was refused" look identical if only the missing value is reported, and that
-    // ambiguity once hid a real bug: an elevated scan reported its metadata as unmeasured.
-    let metadata_query = ntfs_metadata(path);
-    let metadata = metadata_query.as_ref().ok().and_then(|m| *m);
-
-    // NTFS marks its own system files as metadata and excludes them from directory
-    // enumeration, so a walk never sees them however privileged it is. They have to be
-    // measured by name.
-    let system = system_files(path);
-    let system_total: u64 = system.iter().filter_map(|f| f.allocated).sum();
-    let system_measured = system.iter().filter(|f| f.allocated.is_some()).count();
-    let system_failed = system.len() - system_measured;
-
-    // `$MFT`'s real allocation supersedes the valid-data-length figure from the control code,
-    // which counts only the portion holding live records and so understates the table.
-    let mft = mft_allocation(path).or_else(|| metadata.as_ref().map(|m| m.mft_bytes));
-
-    let known_metadata = if system_measured > 0 || mft.is_some() {
-        Some(mft.unwrap_or(0).saturating_add(system_total))
-    } else {
-        metadata
-            .as_ref()
-            .map(|m| m.mft_bytes.saturating_add(m.usn_journal_max_bytes))
-    };
-
-    let accounting = Accounting {
-        total: v.total_bytes,
-        free: v.free_bytes,
-        file_bytes: s.allocated_bytes,
-        // Named streams are measured on allocation, on the same handle that measures the
-        // main data. Files whose streams could not be enumerated stay out of this figure, so
-        // the residual carries their unknown part honestly rather than being flattered by a
-        // zero.
-        stream_bytes: s.stream_bytes,
-        directory_bytes: s.directory_bytes,
-        known_metadata,
-        denied: Denied::new(s.denied_directories.saturating_add(s.denied_files)),
-    };
+    // The numbers come from the shared accounting; this function only renders them. The
+    // desktop's dashboard reads the same struct, so the finding is identical on screen.
+    let found = hfs_import::account_volume(path, s)?;
+    let accounting = &found.accounting;
 
     let residual = accounting.residual();
     let ratio = accounting.residual_ratio();
@@ -440,15 +392,15 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
 
     let _ = writeln!(out);
     let _ = writeln!(out, "components of the figure above:");
-    match mft {
+    match found.mft_bytes {
         Some(bytes) => {
             let _ = writeln!(out, "  master file table     {} — measured", human(bytes));
         }
-        None => match &metadata_query {
-            Err(err) => {
+        None => match &found.metadata_error {
+            Some(err) => {
                 let _ = writeln!(out, "  filesystem metadata   query refused: {err}");
             }
-            _ => {
+            None => {
                 let _ = writeln!(
                     out,
                     "  filesystem metadata   not measured — requires an elevated scan"
@@ -456,24 +408,25 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
             }
         },
     }
-    if system_measured > 0 {
+    if found.system_measured > 0 {
         let _ = writeln!(
             out,
             "  ntfs system files     {} across {} files — measured",
-            human(system_total),
-            system_measured
+            human(found.system_bytes),
+            found.system_measured
         );
-        if system_failed > 0 {
+        if found.system_failed > 0 {
             let _ = writeln!(
                 out,
-                "                        {system_failed} could not be opened, so the total is low"
+                "                        {} could not be opened, so the total is low",
+                found.system_failed
             );
         }
     }
     // Only shown when it contributed. Once the system files are measured by name the journal is
     // already inside that total, and listing it again would overstate what was counted.
-    if system_measured == 0 {
-        if let Some(m) = &metadata {
+    if found.system_measured == 0 {
+        if let Some(m) = &found.metadata {
             if m.usn_journal_max_bytes > 0 {
                 let _ = writeln!(
                     out,
@@ -566,7 +519,7 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
         let _ = writeln!(out, "and can occupy up to a tenth of the volume.");
     }
 
-    match reconcile(&accounting, RESIDUAL_TOLERANCE) {
+    match found.reconciliation {
         Reconciliation::Explained { .. } => {
             let _ = writeln!(out);
             let _ = writeln!(

@@ -59,6 +59,28 @@ impl FileProvenance {
     pub const fn allocation_measured(self) -> bool {
         !matches!(self, Self::Denied | Self::Unknown)
     }
+
+    /// What the code means, in the words an interface shows beside a figure.
+    ///
+    /// Lives here so every frontend describes provenance identically: the CLI's `explain`,
+    /// the finder's detail pane and the desktop's evidence panel all read this one text.
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Full => "allocation, identity and streams",
+            Self::NoIdentity => {
+                "allocation and streams; identity unavailable, so hardlink grouping may overcount"
+            }
+            Self::NoStreams => {
+                "allocation and identity; streams never enumerated, so the stream figure is unknown"
+            }
+            Self::Denied => {
+                "nothing — the entry could not be opened, and its size is the directory's report"
+            }
+            Self::Unknown => {
+                "an unknown combination — indexed before provenance was recorded; treat as approximate"
+            }
+        }
+    }
 }
 
 #[cfg(test)]

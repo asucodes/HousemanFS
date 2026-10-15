@@ -91,6 +91,18 @@ impl Accounting {
     }
 }
 
+/// Tolerance for the residual, as a fraction of volume capacity.
+///
+/// Not zero, because a real volume always holds things a directory walk cannot see:
+/// filesystem metadata, alternate data streams, and paths the caller may not read. The
+/// point is not to eliminate the residual but to keep it small and to explain it.
+///
+/// A judgment, not a measurement: an elevated scan attributes all but ~2.4%, and the
+/// structurally unmeasurable remainder plausibly fits inside 2% on a healthy NTFS volume.
+/// Provisional until an elevated scan with streams lands at or under it; if it lands
+/// above, the tolerance moves with a written reason, not silently.
+pub const RESIDUAL_TOLERANCE: f64 = 0.02;
+
 /// Whether the accounting explains the volume well enough to be trusted.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Reconciliation {

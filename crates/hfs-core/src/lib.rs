@@ -27,7 +27,7 @@ pub mod identity;
 pub mod names;
 pub mod provenance;
 
-pub use accounting::{Accounting, Denied, Reconciliation, reconcile};
+pub use accounting::{Accounting, Denied, RESIDUAL_TOLERANCE, Reconciliation, reconcile};
 pub use bytes::{ExtentBytes, Ownership};
 pub use format::{TICKS_PER_SECOND, human_age, human_bytes, human_bytes_exact, windows_ticks_now};
 pub use identity::{FileId, FileKey, VolumeId};
