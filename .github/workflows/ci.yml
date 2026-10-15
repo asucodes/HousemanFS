@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    # The platform crate calls Windows APIs, so the suite only runs on Windows.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select the pinned toolchain
+        # rust-toolchain.toml names the version; this makes the components match it.
+        run: rustup show active-toolchain
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Lints
+        run: cargo clippy --workspace -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
