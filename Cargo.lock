@@ -309,6 +309,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hfs-model"
+version = "0.0.0"
+dependencies = [
+ "hfs-core",
+]
+
+[[package]]
 name = "hfs-tui"
 version = "0.0.0"
 dependencies = [

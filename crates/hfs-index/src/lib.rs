@@ -777,15 +777,10 @@ fn split_parent(path: &str) -> Option<(String, String)> {
 
 /// Split a filename into its extension, lowercased, without the dot.
 ///
-/// Returns an empty string for names with no extension. Leading dots are not treated as
-/// extensions, so `.gitignore` has none — which is what a user would expect.
-pub fn extension_of(name: &str) -> String {
-    let stem = name.rsplit(['\\', '/']).next().unwrap_or(name);
-    match stem.rsplit_once('.') {
-        Some((prefix, ext)) if !prefix.is_empty() && !ext.is_empty() => ext.to_ascii_lowercase(),
-        _ => String::new(),
-    }
-}
+/// Lives in `hfs-core` because it is pure string handling with no persistence in it; the
+/// decision-model crate needs it too, and depending on the index for one function would drag
+/// SQLite into the model's build graph. Re-exported here so existing callers do not move.
+pub use hfs_core::extension_of;
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,11 @@
+[package]
+name = "hfs-model"
+description = "The decision-model boundary: state assembly, typed questions, calibration. No platform code, no storage."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hfs-core = { path = "../hfs-core" }
