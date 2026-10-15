@@ -4,9 +4,10 @@ A local, read-only filesystem index that tells you the truth about your storage,
 questions about it in plain language, and shows the evidence behind every number it reports.
 
 > **Status: Phase 0 in progress.**
-> The accounting model exists in `hfs-core`: file identity, extent ownership, and volume
-> reconciliation with an explicit residual, all covered by tests. Nothing scans a real volume
-> yet, and nothing writes to one. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
+> The accounting model exists in `hfs-core`. The Windows platform layer walks a real volume and
+> reconciles what it finds against what the filesystem reports, decomposing whatever it could
+> not account for; an index and a read-only finder interface exist on top. Nothing writes to a
+> scanned volume. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ---
 
