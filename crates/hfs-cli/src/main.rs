@@ -26,6 +26,8 @@ usage:
   housemanfs dirs [n]       largest directory subtrees (default 20)
   housemanfs find <term>    files whose name contains <term>
   housemanfs ext [n]        occupied space by extension
+  housemanfs explain <path> the measurement behind one indexed path
+  housemanfs export         the index as versioned JSON (see --out)
 
 options:
   --out <file>              write the report to a file instead of stdout
@@ -86,7 +88,11 @@ fn main() -> ExitCode {
 
     // Queries are meaningless without a target, and an empty one would otherwise silently
     // scan or query nothing while reporting success.
-    if matches!(command.as_str(), "info" | "scan" | "index" | "find") && path.is_empty() {
+    if matches!(
+        command.as_str(),
+        "info" | "scan" | "index" | "find" | "explain"
+    ) && path.is_empty()
+    {
         eprintln!("error: `{command}` needs an argument");
         return ExitCode::FAILURE;
     }
@@ -114,6 +120,8 @@ fn main() -> ExitCode {
         "dirs" => index::dirs(&db, limit, &mut out),
         "find" => index::search(&db, &path, limit, &mut out),
         "ext" => index::extensions(&db, limit, &mut out),
+        "explain" => index::explain(&db, &path, &mut out),
+        "export" => index::export(&db, limit, &mut out),
         "finder" | "ui" => {
             // The finder takes over the terminal, so it cannot also write into the report
             // buffer. It is dispatched before any output is produced.
@@ -241,10 +249,12 @@ fn scan(path: &str, out: &mut String) -> Result<(), String> {
     if s.stream_count > 0 {
         let _ = writeln!(
             out,
-            "streams     {} across {} streams on {} files",
+            "streams     {} across {} {} on {} {}",
             human(s.stream_bytes),
             s.stream_count,
-            s.stream_files
+            index::plural(s.stream_count, "stream", "streams"),
+            s.stream_files,
+            index::plural(s.stream_files, "file", "files"),
         );
         let _ = writeln!(
             out,
@@ -468,6 +478,13 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
             );
             let _ = writeln!(out, "                        so the total is low");
         }
+        // Directory streams are never in this total: the enumeration API fails on directory
+        // handles, and the fallback reports logical sizes without allocations. One line,
+        // always, so the figure is never read as complete.
+        let _ = writeln!(
+            out,
+            "                        streams on directories are not enumerated"
+        );
     } else if s.stream_unknown_files > 0 {
         // Nothing was found, but not every file was examined. Reporting "none" here would be
         // exactly the optimistic lie the residual exists to prevent.

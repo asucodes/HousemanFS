@@ -24,12 +24,12 @@ use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_STREAM_INFO, FileIdInfo,
-    FileStandardInfo, FileStreamInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch,
-    FindFirstFileExW, FindNextFileW, GetFileInformationByHandleEx, OPEN_EXISTING,
-    WIN32_FIND_DATAW,
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_STREAM_INFO,
+    FileIdInfo, FileStandardInfo, FileStreamInfo, FindClose, FindExInfoBasic,
+    FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, GetFileInformationByHandleEx,
+    OPEN_EXISTING, WIN32_FIND_DATAW,
 };
 
 use crate::util::{from_wide, last_error, to_wide};
@@ -72,6 +72,20 @@ pub struct ScannedEntry {
     pub allocated: u64,
     /// How many names point at this file.
     pub links: u32,
+
+    /// Allocated bytes across the entry's named streams. Zero is a measurement only when
+    /// `streams_known` is true; otherwise the streams were never enumerated.
+    pub stream_bytes: u64,
+    /// How many named streams were found.
+    pub stream_count: u32,
+    /// Whether the streams were enumerated. False means unknown, never zero: a failed query
+    /// is the absence of a measurement, and the index records the difference.
+    pub streams_known: bool,
+    /// True when the entry could not be opened at all, so `allocated` is the directory
+    /// entry's report rather than a measurement. The walk already counts such files in its
+    /// totals; this flag lets downstream consumers (the index, `explain`) say so per entry
+    /// instead of only in aggregate.
+    pub denied: bool,
 }
 
 /// Totals gathered during a walk.
@@ -168,13 +182,42 @@ pub fn walk(root: &str) -> io::Result<Walk> {
     walk_with(root, WalkOptions::default())
 }
 
+/// Identity and self-occupancy of a single path, without walking beneath it.
+///
+/// The walk reports everything *under* the root but never the root itself, so the index
+/// synthesises a root row from this: without it, files directly on the root would have no
+/// parent row, and every query that joins files to directories would silently drop them.
+#[derive(Debug, Clone, Copy)]
+pub struct PathFacts {
+    /// Stable identity of the underlying data, when the query succeeded.
+    pub id: Option<[u8; 16]>,
+    /// Bytes the path itself occupies: index blocks for a directory, data for a file.
+    pub allocated: u64,
+}
+
+/// Ask the filesystem for one path's identity and self-occupancy.
+///
+/// Opened attributes-only like everything else the walk touches. Failing is an error rather
+/// than a fallback because the caller decides what an unknown root means.
+pub fn path_facts(path: &str) -> io::Result<PathFacts> {
+    let facts = query_file(Path::new(&path.replace('/', "\\")))?;
+    Ok(PathFacts {
+        id: facts.id,
+        allocated: facts.allocated,
+    })
+}
+
 /// Walk with explicit options.
 pub fn walk_with(root: &str, options: WalkOptions) -> io::Result<Walk> {
+    // The walk joins paths with the native separator, so a root spelled with forward
+    // slashes would produce mixed `C:/Windows\...` paths all the way down. Normalise once,
+    // up front, so every path the walk reports is spelled one way.
+    let root_path = PathBuf::from(root.replace('/', "\\"));
     let mut summary = WalkSummary::default();
     let mut entries = Vec::new();
     // The root's own identity becomes the parent of everything directly beneath it.
-    let root_id = query_file(Path::new(root)).ok().and_then(|f| f.id);
-    let mut pending: Vec<(PathBuf, Option<[u8; 16]>)> = vec![(PathBuf::from(root), root_id)];
+    let root_id = query_file(&root_path).ok().and_then(|f| f.id);
+    let mut pending: Vec<(PathBuf, Option<[u8; 16]>)> = vec![(root_path, root_id)];
 
     // Identity of every hardlink group already counted. Bounded by the number of hardlinked
     // files rather than by the number of files, so it stays small on typical volumes.
@@ -261,6 +304,11 @@ fn read_directory(
                         logical,
                         allocated: 0,
                         links: 0,
+                        // Never opened, so never enumerated. Unknown, not zero.
+                        stream_bytes: 0,
+                        stream_count: 0,
+                        streams_known: false,
+                        denied: false,
                     });
                 }
             } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
@@ -277,14 +325,25 @@ fn read_directory(
                 let id = queried.as_ref().and_then(|f| f.id);
                 summary.directory_bytes += allocated;
 
-                // A directory can carry named streams too. Rare, but the whole point of this
-                // field is that it would otherwise be invisible: the handle is already open,
-                // so the enumeration is free.
-                if let Some(facts) = &queried {
-                    if let Some(streams) = &facts.streams {
-                        summary.stream_bytes += streams.bytes;
-                        summary.stream_count += streams.count as u64;
-                    }
+                // A directory can carry named streams too, but they cannot be enumerated
+                // here: `FileStreamInfo` on a directory handle fails with ERROR_HANDLE_EOF
+                // (38) on every directory, old or new. The only documented enumeration,
+                // `FindFirstStreamW`, reports logical sizes without allocations, and mixing
+                // a logical figure into an allocation total would violate the rule the
+                // streams field exists to uphold. So directory streams stay unknown — marked
+                // on the entry, and disclosed once in the report rather than counted per
+                // directory, which would flood the totals with hundreds of thousands of
+                // identical unknowns.
+                let (dir_streams, dir_streams_known) = match &queried {
+                    Some(facts) => match &facts.streams {
+                        Some(streams) => ((streams.bytes, streams.count), true),
+                        None => ((0, 0), false),
+                    },
+                    None => ((0, 0), false),
+                };
+                if dir_streams_known {
+                    summary.stream_bytes += dir_streams.0;
+                    summary.stream_count += dir_streams.1 as u64;
                 }
 
                 if options.collect_entries {
@@ -296,8 +355,13 @@ fn read_directory(
                         logical: 0,
                         allocated,
                         links: 0,
+                        stream_bytes: dir_streams.0,
+                        stream_count: dir_streams.1,
+                        streams_known: dir_streams_known,
+                        denied: false,
                     });
                 }
+
                 children.push((path, id));
             } else {
                 record_file(
@@ -336,13 +400,8 @@ fn record_file(
 ) {
     summary.files += 1;
 
-    let (allocated, links, id, streams) = match query_file(path) {
-        Ok(facts) => (
-            facts.allocated,
-            facts.links,
-            facts.id,
-            facts.streams,
-        ),
+    let (allocated, links, id, streams, denied) = match query_file(path) {
+        Ok(facts) => (facts.allocated, facts.links, facts.id, facts.streams, false),
         Err(_) => {
             // Still counted, using the size the directory entry reported, so a locked or
             // protected file does not silently vanish from the totals. Its true allocation is
@@ -351,7 +410,7 @@ fn record_file(
             // two unknowns would misstate one problem as two.
             summary.denied_files += 1;
             summary.denied_file_bytes += logical;
-            (logical, 1, None, None)
+            (logical, 1, None, None, true)
         }
     };
 
@@ -390,16 +449,23 @@ fn record_file(
                     summary.stream_files += 1;
                 }
             }
-            None => {
+            None if !denied => {
                 // The file opened, so its main allocation is measured, but its streams could
                 // not be enumerated. Recorded so that a systematic failure to enumerate —
-                // rather than an absence of streams — is visible in the report.
+                // rather than an absence of streams — is visible in the report. Unreadable
+                // files are excluded: they are already counted as unreadable, and counting
+                // them here too would misstate one problem as two.
                 summary.stream_unknown_files += 1;
             }
+            None => {}
         }
     }
 
     if options.collect_entries {
+        let (stream_bytes, stream_count, streams_known) = match streams {
+            Some(facts) => (facts.bytes, facts.count, true),
+            None => (0, 0, false),
+        };
         entries.push(ScannedEntry {
             path: path.to_path_buf(),
             kind: EntryKind::File,
@@ -408,6 +474,10 @@ fn record_file(
             logical,
             allocated,
             links,
+            stream_bytes,
+            stream_count,
+            streams_known,
+            denied,
         });
     }
 }
@@ -588,8 +658,7 @@ fn parse_streams(buffer: &[u8]) -> Option<StreamFacts> {
         // SAFETY: `buffer` is 8-byte aligned (see the caller), `offset` advances by
         // `NextEntryOffset`, which the API guarantees to be 8-byte aligned, and the fixed
         // part fits within the buffer.
-        let entry =
-            unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_STREAM_INFO) };
+        let entry = unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_STREAM_INFO) };
 
         let name_end = offset + FIXED + entry.StreamNameLength as usize;
         let name = if entry.StreamNameLength == 0 {

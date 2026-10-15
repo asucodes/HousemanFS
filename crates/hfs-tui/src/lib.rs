@@ -97,23 +97,44 @@ impl App {
         let result = match self.view {
             View::Dirs => self.index.largest_dirs(500).map(|rows| {
                 rows.into_iter()
-                    .map(|(path, allocated, count)| Row {
-                        size: human(allocated),
-                        label: path,
-                        detail: format!("{count} files"),
+                    .map(|hit| Row {
+                        size: human(hit.allocated),
+                        label: hit.path,
+                        detail: if hit.streams > 0 {
+                            format!("{} files, streams hold {}", hit.files, human(hit.streams))
+                        } else {
+                            format!("{} files", hit.files)
+                        },
                     })
                     .collect()
             }),
             View::Files => self.index.largest_files(500).map(|rows| {
                 rows.into_iter()
-                    .map(|hit| Row {
-                        size: human(hit.allocated),
-                        label: hit.path,
-                        detail: if hit.links > 1 {
-                            format!("{} names share this data", hit.links)
-                        } else {
-                            String::new()
-                        },
+                    .map(|hit| {
+                        let detail = match (hit.links > 1, hit.stream_count > 0) {
+                            (true, true) => format!(
+                                "{} names share this data, plus {} in {} stream{}",
+                                hit.links,
+                                human(hit.stream_bytes),
+                                hit.stream_count,
+                                if hit.stream_count == 1 { "" } else { "s" },
+                            ),
+                            (true, false) => {
+                                format!("{} names share this data", hit.links)
+                            }
+                            (false, true) => format!(
+                                "{} in {} stream{} the listing never shows",
+                                human(hit.stream_bytes),
+                                hit.stream_count,
+                                if hit.stream_count == 1 { "" } else { "s" },
+                            ),
+                            (false, false) => String::new(),
+                        };
+                        Row {
+                            size: human(hit.allocated),
+                            label: hit.path,
+                            detail,
+                        }
                     })
                     .collect()
             }),

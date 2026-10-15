@@ -16,3 +16,7 @@ hfs-core = { path = "../hfs-core" }
 hfs-index = { path = "../hfs-index" }
 hfs-tui = { path = "../hfs-tui" }
 hfs-win = { path = "../hfs-win" }
+# The versioned JSON export is the project's extension surface (D11): the one place where
+# machine-readable output is a promise rather than a convenience. Kept to the CLI so no
+# library crate carries a serialisation framework.
+serde_json = "1.0"
