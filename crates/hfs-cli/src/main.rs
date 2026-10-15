@@ -10,8 +10,8 @@ use std::process::ExitCode;
 
 use hfs_core::{Accounting, Denied, Reconciliation, reconcile};
 use hfs_win::{
-    BackupPrivilege, WalkSummary, enable_backup_privilege, is_elevated, mft_allocation,
-    ntfs_metadata, system_files, volume_info, walk,
+    BackupPrivilege, WalkSummary, enable_backup_privilege, holds_backup_privilege, is_elevated,
+    mft_allocation, ntfs_metadata, system_files, volume_info, walk,
 };
 
 const USAGE: &str = "\
@@ -194,21 +194,34 @@ fn scan(path: &str, out: &mut String) -> Result<(), String> {
     let result = walk(path).map_err(|e| e.to_string())?;
     let s = &result.summary;
 
+    // A privilege that could not be obtained is not a reason to stop. The scan is still useful
+    // with less visibility, and the point of reporting the outcome is to let the user judge the
+    // numbers, not to refuse to produce them.
+    let privilege_note = match backup {
+        BackupPrivilege::Enabled => "backup privilege enabled".to_string(),
+        // These two are different problems: one means the process is not an administrator, the
+        // other means the privilege is there and something else stopped it being switched on.
+        BackupPrivilege::NotHeld if holds_backup_privilege() => {
+            "backup privilege held but could not be enabled".to_string()
+        }
+        BackupPrivilege::NotHeld => "backup privilege not held by this token".to_string(),
+        // The code is printed rather than flattened to "failed", because the difference
+        // between access denied and bad length decides what to try next.
+        BackupPrivilege::Failed(code) => {
+            format!("backup privilege could not be enabled (os error {code})")
+        }
+    };
+
     let _ = writeln!(out, "scanned     {path}");
     let _ = writeln!(
         out,
-        "privilege   {}{}",
+        "privilege   {}, {}",
         if is_elevated() {
             "elevated"
         } else {
             "standard user"
         },
-        match backup {
-            BackupPrivilege::Enabled => ", backup privilege enabled",
-            BackupPrivilege::AlreadyEnabled => ", backup privilege already held",
-            BackupPrivilege::NotHeld => ", no backup privilege",
-            BackupPrivilege::Failed => ", backup privilege refused",
-        }
+        privilege_note
     );
     let _ = writeln!(out);
     let _ = writeln!(out, "files       {}", s.files);

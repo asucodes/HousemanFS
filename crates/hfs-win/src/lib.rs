@@ -24,6 +24,6 @@ pub mod walk;
 
 pub use elevation::is_elevated;
 pub use ntfs::{NtfsMetadata, SystemFile, mft_allocation, ntfs_metadata, system_files};
-pub use privilege::{BackupPrivilege, enable_backup_privilege};
+pub use privilege::{BackupPrivilege, enable_backup_privilege, holds_backup_privilege};
 pub use volume::{VolumeInfo, volume_info};
 pub use walk::{EntryKind, ScannedEntry, Walk, WalkOptions, WalkSummary, walk, walk_with};
