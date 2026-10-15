@@ -13,6 +13,7 @@
 //! renders whatever exists. Selection is a path, and the evidence panel explains it with
 //! the same words the CLI's `explain` prints.
 
+mod dupes;
 mod scan;
 mod screens;
 mod treemap;
@@ -52,16 +53,18 @@ enum Screen {
     Browse,
     Map,
     Search,
+    Duplicates,
     Suggest,
 }
 
 impl Screen {
-    const ALL: [(Screen, &'static str); 6] = [
+    const ALL: [(Screen, &'static str); 7] = [
         (Screen::Home, "Scan"),
         (Screen::Dashboard, "Dashboard"),
         (Screen::Browse, "Browse"),
         (Screen::Map, "Map"),
         (Screen::Search, "Search"),
+        (Screen::Duplicates, "Duplicates"),
         (Screen::Suggest, "Suggest"),
     ];
 }
@@ -118,6 +121,11 @@ struct App {
     suggest_rows: Vec<SuggestRow>,
     suggest_ran: bool,
     eval_report: EvalReport,
+    dup_worker: Option<dupes::DupWorker>,
+    dup_progress: (u64, u64),
+    dup_report: Option<dupes::DupReport>,
+    dup_error: Option<String>,
+    dup_min: usize,
 }
 
 impl App {
@@ -167,6 +175,11 @@ impl App {
             suggest_rows: Vec::new(),
             suggest_ran: false,
             eval_report,
+            dup_worker: None,
+            dup_progress: (0, 0),
+            dup_report: None,
+            dup_error: None,
+            dup_min: 2,
         }
     }
 
@@ -263,6 +276,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker(context);
+        self.poll_dupes(context);
 
         egui::TopBottomPanel::top("nav").show(context, |ui| {
             ui.horizontal(|ui| {
@@ -295,6 +309,7 @@ impl eframe::App for App {
             Screen::Browse => self.show_browse(ui),
             Screen::Map => self.show_map(ui),
             Screen::Search => self.show_search(ui),
+            Screen::Duplicates => self.show_duplicates(ui),
             Screen::Suggest => self.show_suggest(ui),
         });
 

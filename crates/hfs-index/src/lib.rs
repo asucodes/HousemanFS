@@ -210,6 +210,35 @@ pub struct DirHit {
     pub files: u64,
 }
 
+/// Files sharing one reported size: one input to hashing.
+#[derive(Debug, Clone)]
+pub struct SizeGroup {
+    pub logical: u64,
+    pub members: Vec<SizeMember>,
+}
+
+impl SizeGroup {
+    /// How many distinct datasets the group holds. One means a hardlink family, not a
+    /// duplicate — the bytes exist once however many names point at them.
+    pub fn distinct_ids(&self) -> usize {
+        let mut ids: Vec<&Vec<u8>> = self.members.iter().map(|m| &m.id).collect();
+        ids.sort();
+        ids.dedup();
+        ids.len()
+    }
+}
+
+/// One dataset in a size group: a single member even when several names share it.
+#[derive(Debug, Clone)]
+pub struct SizeMember {
+    pub path: String,
+    pub allocated: u64,
+    /// File identity, so hardlink families collapse to one member downstream.
+    pub id: Vec<u8>,
+    /// How many names point at this dataset.
+    pub links: u32,
+}
+
 /// A structured question over the index: the typed intermediate representation.
 ///
 /// Queries cross the API boundary in this shape, never as SQL strings — the index owns all
@@ -1140,6 +1169,78 @@ impl Index {
         rows.collect()
     }
 
+    /// Files sharing one reported size: duplicate *candidates*, not duplicates.
+    ///
+    /// Same size does not mean same bytes — hashing decides that later. What this query
+    /// guarantees is cheaper: every group holds files whose logical sizes match, each
+    /// hardlink group appearing once (several names for one dataset are one member, flagged
+    /// by `links`), ordered largest first. Groups and members are both capped, because a
+    /// volume holds millions of small files and hashing starts where the bytes are.
+    pub fn size_groups(
+        &self,
+        min_logical: u64,
+        max_groups: u32,
+        max_members: u32,
+    ) -> rusqlite::Result<Vec<SizeGroup>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.logical, d.path, f.name, f.allocated, f.id, f.links
+             FROM files f JOIN dirs d ON f.parent = d.id
+             WHERE f.logical >= ?1
+             ORDER BY f.logical DESC",
+        )?;
+        let mut groups: Vec<SizeGroup> = Vec::new();
+        let mut current: Option<SizeGroup> = None;
+        let mut rows = stmt.query(params![min_logical as i64])?;
+        while let Some(row) = rows.next()? {
+            let dir: String = row.get(1)?;
+            let name: String = row.get(2)?;
+            let logical = row.get::<_, i64>(0)? as u64;
+            let member = SizeMember {
+                path: join_path(&dir, &name),
+                allocated: row.get::<_, i64>(3)? as u64,
+                id: row.get::<_, Vec<u8>>(4)?,
+                links: row.get::<_, u32>(5)?,
+            };
+            let same_group = current.as_ref().is_some_and(|group| group.logical == logical);
+            if !same_group {
+                if let Some(group) = current.take() {
+                    // A lone dataset is not a group: one hardlink family, however many
+                    // names, occupies its bytes once and duplicates nothing.
+                    if group.distinct_ids() > 1 {
+                        groups.push(group);
+                        if groups.len() >= max_groups as usize {
+                            break;
+                        }
+                    }
+                }
+                current = Some(SizeGroup {
+                    logical,
+                    members: Vec::new(),
+                });
+            }
+            if let Some(group) = current.as_mut() {
+                // One member per dataset: extra names for the same id add no bytes and no
+                // information, but the links count travels so the view can say so.
+                match group.members.iter_mut().find(|m| m.id == member.id) {
+                    Some(existing) => {
+                        existing.links = existing.links.max(member.links);
+                    }
+                    None => {
+                        if group.members.len() < max_members as usize {
+                            group.members.push(member);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(group) = current.take() {
+            if group.distinct_ids() > 1 {
+                groups.push(group);
+            }
+        }
+        Ok(groups)
+    }
+
     /// The index as versioned JSON: the extension surface.
     ///
     /// Anything may build on this output in any language, without running code inside a
@@ -1709,6 +1810,45 @@ CREATE TABLE files (
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].path.ends_with("fresh.iso"));
+    }
+
+    #[test]
+    fn size_groups_collect_same_size_datasets_once_each() {
+        let mut index = empty();
+        let root = [1u8; 16];
+        let dir = root_dir();
+        // Two datasets share a size — one of them under two names — and a third stands
+        // alone at its own size.
+        let files = [
+            file_row([2u8; 16], root, "a.iso", 100_000, 100),
+            FileRow {
+                id: [2u8; 16],
+                parent: root,
+                name: "a-copy.iso".to_string(),
+                ext: "iso".to_string(),
+                logical: 100_000,
+                allocated: 100_000,
+                links: 2,
+                stream_bytes: 0,
+                stream_count: 0,
+                provenance: FileProvenance::Full,
+                modified: 0,
+            },
+            file_row([3u8; 16], root, "b.iso", 100_000, 100),
+            file_row([4u8; 16], root, "lonely.bin", 50_000, 100),
+        ];
+        index
+            .write_scan(&meta(), std::iter::once(&dir), files.iter())
+            .unwrap();
+
+        let groups = index.size_groups(0, 10, 10).unwrap();
+        assert_eq!(groups.len(), 1, "only the shared size groups");
+        assert_eq!(groups[0].logical, 100_000);
+        assert_eq!(groups[0].members.len(), 2, "the hardlink family is one member");
+        assert_eq!(groups[0].distinct_ids(), 2);
+
+        // The floor excludes everything.
+        assert!(index.size_groups(200_000, 10, 10).unwrap().is_empty());
     }
 
     #[test]
