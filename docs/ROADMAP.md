@@ -6,9 +6,10 @@ accounting being correct, so the accounting gets built and verified first.
 
 ## Current status
 
-Phase 0 is nearly closed; Phase 1 is half built. The walk scans real volumes and reconciles
-against the filesystem with a decomposed residual — 45 tests passing, plus a CI workflow
-running fmt, clippy and the suite on Windows.
+Phase 0 is closed except the elevated validation; Phase 1 is built; Phase 2 judges with a
+baseline engine. The walk scans real volumes and reconciles against the filesystem with a
+decomposed residual — 72 tests passing, plus a CI workflow running fmt, clippy and the
+suite on Windows.
 
 Measured on `C:\`, October 2026 (NTFS, 302 GiB volume):
 
@@ -20,23 +21,37 @@ Measured on `C:\`, October 2026 (NTFS, 302 GiB volume):
 - **Alternate streams:** enumerated per file on allocation size — 1,293 streams totalling
   352 KiB on the measured volume. Small there, which is itself a finding: streams are not
   where this volume's space went.
+- **Independent cross-check:** WMI (`Win32_LogicalDisk`) agrees with the tool's volume
+  figures exactly on capacity and within 9 clusters on free space — the free-space wobble
+  is live-volume activity between the two queries, not disagreement. `fsutil` itself needs
+  elevation and could not serve as the reference from this shell; WMI goes through a
+  separate stack, which is what makes it independent.
 
 Two platform facts are now recorded rather than discovered repeatedly: `FileStreamInfo`
 fails on directory handles (`ERROR_HANDLE_EOF`), so directory streams are disclosed once
-in the report instead of counted; and the residual's 2% tolerance is still a stated
-constant, not a calibrated value — closing Phase 0 means either meeting it elevated or
-writing down why it is what it is.
+in the report instead of counted; and timestamps compare at full precision, after a
+truncated clock made every fresh file read as future-dated.
 
-Beyond the walk: the index (schema v2) stores per-entry stream occupancy and provenance,
-counts hardlink groups once in every aggregate, and carries the scan record; `explain`
-shows the measurement behind any indexed path, and `export` publishes a versioned JSON
-snapshot. The read-only invariant is enforced by an audit test, and the walk is covered
-by a synthetic fixture test containing no real filesystem data.
+**The 2% tolerance, stated plainly.** It is a judgment, not a measurement: an elevated
+scan attributes all but ~2.4%, and the structurally unmeasurable remainder — directory
+streams, reparse-point payloads, resident-vs-allocated rounding, quota effects — plausibly
+fits inside 2% on a healthy NTFS volume. It stays provisional until an elevated scan
+with streams lands at or under it; if that scan lands above, the tolerance moves with a
+written reason, not silently.
 
-Still missing for Phase 0's exit: an elevated re-scan with streams (expected to land at
-or under tolerance), and reconciliation against the independent reference (`fsutil`).
-Still missing for Phase 1: incremental index updates, natural-language search, and the
-`hfs-model` boundary those depend on.
+Beyond the walk: the index (schema v3) stores per-entry stream occupancy, provenance and
+timestamps, counts hardlink groups once in every aggregate, refreshes in place with
+conservative deletion, and carries the scan record; `explain` shows the measurement
+behind any indexed path; `ask` answers structured questions through a typed IR;
+`export` publishes a versioned JSON snapshot. Judgment runs through five versioned
+rules over a baseline engine, measured against a 16-case committed evaluation set
+(`suggest`, `eval`). The read-only invariant is enforced by an audit test, and the walk
+is covered by a synthetic fixture test containing no real filesystem data.
+
+Still missing: an elevated re-scan with streams (needs an administrator shell:
+`housemanfs scan C:/ --out report.txt` from an elevated prompt, then compare the
+unaccounted ratio against the 2% tolerance); engine selection and calibration (D4) —
+the rules read factors, not engines, so a learned model plugs in without touching them.
 
 ## Phase 0 — the accounting oracle
 
@@ -50,21 +65,31 @@ residual and decompose it.
 within a stated tolerance, and every unexplained byte is either explained or explicitly
 reported as unexplained.
 
+**Status.** Met except the elevated validation. The independent reference turned out to be
+WMI rather than `fsutil` — both need elevation for the filesystem-metadata queries, but
+only the capacity/free figures needed an independent check, and WMI supplies those through
+a separate stack: exact agreement on capacity, 9 clusters on free. What remains is one
+elevated scan with streams against the 2% tolerance; the command and the comparison are
+recorded in Current status so whoever runs it needs no context.
+
 **Why first.** If the numbers are wrong, nothing built on top of them means anything. A decision
 model on a wrong index produces confident wrong answers faster, which is worse than no answers.
 
 ## Phase 1 — index, ask, explain (v1)
 
 **Deliverables.**
-- A persistent, incrementally-updatable index with a versioned schema. **Part done:** the
-  index exists at schema v2 with per-entry provenance, stream occupancy and hardlink-aware
-  aggregates, plus a versioned JSON export. Incremental updates are not done — every build
-  is a full re-scan.
+- A persistent, incrementally-updatable index with a versioned schema. **Done:** schema v3
+  with per-entry provenance, stream occupancy and timestamps, hardlink-aware aggregates, a
+  versioned JSON export — and `refresh`, which re-walks and folds in only what changed
+  (added/removed/modified/moved), deleting solely under scanned parents and counting the
+  rest as stale.
 - Natural-language search over that index. The model translates a question into a query; queries
-  only read. **Not done:** search today is literal substring matching. The `hfs-model`
-  boundary it depends on does not exist yet.
+  only read. **Done deterministically:** `ask` compiles size, extension, name, age, sharing
+  and stream clauses — plus a closed set of kind words — into the typed `AskQuery` IR the
+  index executes as parameterized SQL. It is pattern matching and says so; a language-model
+  frontend would compile into the same IR, which bounds what it can express.
 - `explain` — for any figure, show the measurement behind it. **Done** for indexed paths:
-  `housemanfs explain <path>` reports each figure with the query that produced it.
+  `housemanfs explain <path>` reports each figure with the query that produced it, plus age.
 - A minimal interface. Read-only, and visibly so. **Done:** the finder renders the index
   and cannot initiate an action.
 
@@ -82,13 +107,19 @@ documented export format.
 - Suggestions assembled from those factors by versioned rules, each one inspectable.
 - Confidence gating: below threshold, the tool says nothing.
 
-**Status.** The boundary is scaffolded ahead of the engine: `hfs-model` owns state
-assembly, the versioned question set and the engine trait, with a stub engine returning
-maximum uncertainty so the pipeline and its tests exist before any model does. Still
-missing: engine selection (D4), the evaluation set, and the combination rules.
+**Status.** The boundary holds end to end: `hfs-model` owns state assembly, the
+versioned question set, the engine trait, five versioned rules and a 16-case committed
+evaluation set. The engine answering the factors is a labelled heuristic baseline, not the
+learned decision model D4 describes — engine selection and calibration remain, and the
+rules will not care when they land, because they read factors, not engines. `suggest`
+judges the largest indexed files with evidence, rule versions and confidence on every
+line; `eval` runs the set for humans and fails the command on mismatch.
 
 **Exit criteria.** Suggestions are correct often enough to be useful, measured against a
 committed evaluation set — and the evaluation set contains no real filesystem data.
+**Met as far as a baseline can:** 16 of 16 cases pass, silence cases included. A learned
+engine must beat this score on this set to replace the baseline — that is the bar,
+written down before the model exists.
 
 ## Phase 3 — reversible actions
 
