@@ -144,13 +144,7 @@ pub fn holds_backup_privilege() -> bool {
         // The first call is expected to fail with ERROR_INSUFFICIENT_BUFFER; its purpose is to
         // report how large the buffer needs to be.
         let mut needed: u32 = 0;
-        GetTokenInformation(
-            token,
-            TokenPrivileges,
-            std::ptr::null_mut(),
-            0,
-            &mut needed,
-        );
+        GetTokenInformation(token, TokenPrivileges, std::ptr::null_mut(), 0, &mut needed);
 
         if needed == 0 {
             CloseHandle(token);
