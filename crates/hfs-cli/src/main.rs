@@ -238,6 +238,20 @@ fn scan(path: &str, out: &mut String) -> Result<(), String> {
     let _ = writeln!(out, "slack       {}", human(s.slack_bytes));
     let _ = writeln!(out, "dir index   {}", human(s.directory_bytes));
 
+    if s.stream_count > 0 {
+        let _ = writeln!(
+            out,
+            "streams     {} across {} streams on {} files",
+            human(s.stream_bytes),
+            s.stream_count,
+            s.stream_files
+        );
+        let _ = writeln!(
+            out,
+            "            named data the directory listing never shows"
+        );
+    }
+
     if s.hardlinked_files > 0 {
         let _ = writeln!(out);
         let _ = writeln!(
@@ -368,9 +382,11 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
         total: v.total_bytes,
         free: v.free_bytes,
         file_bytes: s.allocated_bytes,
-        // Alternate data streams are not yet enumerated. Left at zero so the residual absorbs
-        // them honestly rather than being flattered by an estimate.
-        stream_bytes: 0,
+        // Named streams are measured on allocation, on the same handle that measures the
+        // main data. Files whose streams could not be enumerated stay out of this figure, so
+        // the residual carries their unknown part honestly rather than being flattered by a
+        // zero.
+        stream_bytes: s.stream_bytes,
         directory_bytes: s.directory_bytes,
         known_metadata,
         denied: Denied::new(s.denied_directories.saturating_add(s.denied_files)),
@@ -437,7 +453,32 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
         "  directory overhead    {} — measured",
         human(s.directory_bytes)
     );
-    let _ = writeln!(out, "  alternate streams     not yet enumerated");
+    if s.stream_count > 0 {
+        let _ = writeln!(
+            out,
+            "  alternate streams     {} across {} streams — measured",
+            human(s.stream_bytes),
+            s.stream_count
+        );
+        if s.stream_unknown_files > 0 {
+            let _ = writeln!(
+                out,
+                "                        {stream_unknown} files' streams could not be queried,",
+                stream_unknown = s.stream_unknown_files
+            );
+            let _ = writeln!(out, "                        so the total is low");
+        }
+    } else if s.stream_unknown_files > 0 {
+        // Nothing was found, but not every file was examined. Reporting "none" here would be
+        // exactly the optimistic lie the residual exists to prevent.
+        let _ = writeln!(
+            out,
+            "  alternate streams     unknown — not enumerable on {unknown} files",
+            unknown = s.stream_unknown_files
+        );
+    } else {
+        let _ = writeln!(out, "  alternate streams     none found — measured");
+    }
     if s.denied_directories > 0 {
         let _ = writeln!(
             out,

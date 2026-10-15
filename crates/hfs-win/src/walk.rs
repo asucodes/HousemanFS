@@ -22,13 +22,14 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdInfo,
-    FileStandardInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW,
-    FindNextFileW, GetFileInformationByHandleEx, OPEN_EXISTING, WIN32_FIND_DATAW,
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_STREAM_INFO, FileIdInfo,
+    FileStandardInfo, FileStreamInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch,
+    FindFirstFileExW, FindNextFileW, GetFileInformationByHandleEx, OPEN_EXISTING,
+    WIN32_FIND_DATAW,
 };
 
 use crate::util::{from_wide, last_error, to_wide};
@@ -106,6 +107,24 @@ pub struct WalkSummary {
     pub allocated_bytes: u64,
     /// Bytes lost to rounding files up to whole clusters.
     pub slack_bytes: u64,
+
+    /// Physical bytes occupied by named alternate data streams, counting each hardlink group
+    /// once.
+    ///
+    /// The allocation reported for a file is the allocation of its unnamed `::$DATA` stream.
+    /// A named stream is separate storage with its own extents: it is invisible to directory
+    /// enumeration, invisible to the standard allocation query, and a common source of
+    /// apparently missing space. Measured per stream on allocation size, because a sparse
+    /// stream's clusters — not its logical length — are what occupy the volume.
+    pub stream_bytes: u64,
+    /// Files carrying at least one named stream.
+    pub stream_files: u64,
+    /// Total named streams found, across files and directories.
+    pub stream_count: u64,
+    /// Files that opened but whose streams could not be enumerated, so their stream
+    /// occupancy is unknown rather than zero. Zero is a measurement; this is the absence of
+    /// one, and the two must never be conflated.
+    pub stream_unknown_files: u64,
 
     /// Physical bytes occupied by directories themselves.
     ///
@@ -258,6 +277,16 @@ fn read_directory(
                 let id = queried.as_ref().and_then(|f| f.id);
                 summary.directory_bytes += allocated;
 
+                // A directory can carry named streams too. Rare, but the whole point of this
+                // field is that it would otherwise be invisible: the handle is already open,
+                // so the enumeration is free.
+                if let Some(facts) = &queried {
+                    if let Some(streams) = &facts.streams {
+                        summary.stream_bytes += streams.bytes;
+                        summary.stream_count += streams.count as u64;
+                    }
+                }
+
                 if options.collect_entries {
                     entries.push(ScannedEntry {
                         path: path.clone(),
@@ -307,15 +336,22 @@ fn record_file(
 ) {
     summary.files += 1;
 
-    let (allocated, links, id) = match query_file(path) {
-        Ok(facts) => (facts.allocated, facts.links, facts.id),
+    let (allocated, links, id, streams) = match query_file(path) {
+        Ok(facts) => (
+            facts.allocated,
+            facts.links,
+            facts.id,
+            facts.streams,
+        ),
         Err(_) => {
             // Still counted, using the size the directory entry reported, so a locked or
             // protected file does not silently vanish from the totals. Its true allocation is
-            // unknown, which is recorded rather than estimated.
+            // unknown, which is recorded rather than estimated. Its streams are equally
+            // unknown, but the file is already recorded as unreadable; counting it twice in
+            // two unknowns would misstate one problem as two.
             summary.denied_files += 1;
             summary.denied_file_bytes += logical;
-            (logical, 1, None)
+            (logical, 1, None, None)
         }
     };
 
@@ -345,6 +381,22 @@ fn record_file(
         summary.logical_bytes += logical;
         summary.allocated_bytes += allocated;
         summary.slack_bytes += allocated.saturating_sub(logical);
+
+        match streams {
+            Some(facts) => {
+                summary.stream_bytes += facts.bytes;
+                summary.stream_count += facts.count as u64;
+                if facts.count > 0 {
+                    summary.stream_files += 1;
+                }
+            }
+            None => {
+                // The file opened, so its main allocation is measured, but its streams could
+                // not be enumerated. Recorded so that a systematic failure to enumerate —
+                // rather than an absence of streams — is visible in the report.
+                summary.stream_unknown_files += 1;
+            }
+        }
     }
 
     if options.collect_entries {
@@ -367,6 +419,18 @@ struct FileFacts {
     /// Stable identity of the underlying data, used to detect that two names refer to the same
     /// bytes.
     id: Option<[u8; 16]>,
+    /// The file's named streams, or `None` when they could not be enumerated. `None` is not
+    /// zero: zero named streams is a measurement, and a failed query is the absence of one.
+    streams: Option<StreamFacts>,
+}
+
+/// The named streams one file carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamFacts {
+    /// Allocated bytes across every named stream.
+    bytes: u64,
+    /// How many named streams there are.
+    count: u32,
 }
 
 /// Ask the filesystem for a file's allocation, link count and identity.
@@ -409,9 +473,11 @@ fn query_file(path: &Path) -> io::Result<FileFacts> {
         )
     };
 
-    // Identity is a separate query. A failure here is not fatal — the file is still counted, it
-    // simply cannot participate in hardlink grouping.
-    // SAFETY: as above.
+    // Identity and streams are separate queries; either failing is not fatal. The file is
+    // still counted — it simply cannot participate in hardlink grouping, or its stream
+    // occupancy is recorded as unknown rather than zero.
+    // SAFETY: `handle` is valid and open; each buffer matches the requested information class
+    // and its true size is passed.
     let id_ok = unsafe {
         GetFileInformationByHandleEx(
             handle,
@@ -420,6 +486,9 @@ fn query_file(path: &Path) -> io::Result<FileFacts> {
             std::mem::size_of::<FILE_ID_INFO>() as u32,
         )
     };
+
+    // SAFETY: `handle` is still valid and open; the buffer is grown by the callee as needed.
+    let streams = query_streams(handle);
 
     // SAFETY: `handle` is valid and is closed exactly once, on every path below.
     unsafe { CloseHandle(handle) };
@@ -436,5 +505,246 @@ fn query_file(path: &Path) -> io::Result<FileFacts> {
         } else {
             None
         },
+        streams,
     })
+}
+
+/// Starting buffer for a stream enumeration, in bytes. Room for dozens of entries, which
+/// covers every real file; larger answers grow the buffer instead of being truncated.
+const STREAM_BUFFER_BYTES: usize = 4096;
+
+/// Ceiling for that growth. A file with more named streams than this is pathological, and a
+/// bounded loop means a hostile file cannot make a scan allocate without limit.
+const STREAM_BUFFER_LIMIT: usize = 1024 * 1024;
+
+/// Enumerate a file's named streams on an already-open handle.
+///
+/// The unnamed `::$DATA` stream is skipped: its allocation is what `FileStandardInfo` already
+/// reported, and counting it again would overstate the volume. Every other stream is measured
+/// on allocation size, not logical size, because a sparse stream's clusters are what occupy
+/// the volume — the same rule the main allocation follows.
+///
+/// Returns `None` when the enumeration could not be performed, which the caller records as
+/// unknown. A successful enumeration that finds nothing is `Some` with a zero count, and the
+/// difference is the whole point of the shape.
+fn query_streams(handle: HANDLE) -> Option<StreamFacts> {
+    // The entries are read through a pointer to a struct containing `i64`, so the backing
+    // store must be 8-byte aligned. A `u64` buffer guarantees that; a `u8` buffer would not.
+    let mut buffer = vec![0u64; STREAM_BUFFER_BYTES / std::mem::size_of::<u64>()];
+
+    loop {
+        // SAFETY: `handle` is valid and open; the buffer is 8-byte aligned and its true size
+        // is passed. The API fills only what it fills.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileStreamInfo,
+                buffer.as_mut_ptr() as *mut core::ffi::c_void,
+                (buffer.len() * std::mem::size_of::<u64>()) as u32,
+            )
+        };
+
+        if ok != 0 {
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    buffer.as_ptr() as *const u8,
+                    buffer.len() * std::mem::size_of::<u64>(),
+                )
+            };
+            return parse_streams(bytes);
+        }
+
+        // A truncated answer is reported with `ERROR_MORE_DATA`; the API does not say how
+        // much room it wanted, so the buffer doubles instead. Anything else is a failure to
+        // query, which is recorded as unknown.
+        if last_error().raw_os_error() == Some(ERROR_MORE_DATA as i32)
+            && buffer.len() * std::mem::size_of::<u64>() < STREAM_BUFFER_LIMIT
+        {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        return None;
+    }
+}
+
+/// Parse a `FILE_STREAMS_INFO` buffer into the named streams it describes.
+fn parse_streams(buffer: &[u8]) -> Option<StreamFacts> {
+    // Fixed part of FILE_STREAM_INFO: two u32 counts and two i64 sizes, before the name.
+    // Spelled as an offset rather than computed from the struct's size, which includes tail
+    // padding that the entries do not carry.
+    const FIXED: usize = std::mem::offset_of!(FILE_STREAM_INFO, StreamName);
+
+    let mut bytes = 0u64;
+    let mut count = 0u32;
+    let mut offset = 0usize;
+
+    loop {
+        if offset + FIXED > buffer.len() {
+            // Either the end of the list or a truncated buffer; both mean enumeration is
+            // untrustworthy, and a partial count must not look like a full one.
+            return None;
+        }
+
+        // SAFETY: `buffer` is 8-byte aligned (see the caller), `offset` advances by
+        // `NextEntryOffset`, which the API guarantees to be 8-byte aligned, and the fixed
+        // part fits within the buffer.
+        let entry =
+            unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_STREAM_INFO) };
+
+        let name_end = offset + FIXED + entry.StreamNameLength as usize;
+        let name = if entry.StreamNameLength == 0 {
+            String::new()
+        } else if name_end <= buffer.len() {
+            let wide = unsafe {
+                core::slice::from_raw_parts(
+                    buffer.as_ptr().add(offset + FIXED) as *const u16,
+                    entry.StreamNameLength as usize / 2,
+                )
+            };
+            // Lossy for the same reason as everywhere else: a stream name is not guaranteed
+            // to be valid UTF-16, and a scan must not stop for one.
+            String::from_utf16_lossy(wide)
+        } else {
+            return None;
+        };
+
+        if !name.is_empty() && name != "::$DATA" {
+            bytes += entry.StreamAllocationSize.max(0) as u64;
+            count += 1;
+        }
+
+        if entry.NextEntryOffset == 0 {
+            return Some(StreamFacts { bytes, count });
+        }
+        offset += entry.NextEntryOffset as usize;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::volume::volume_info;
+    use std::io::Write as _;
+
+    /// Serialise one `FILE_STREAM_INFO` entry into `buf` at byte `at`, the way the API packs
+    /// them: fixed part, name, with `next` carrying the reader to the next entry.
+    fn write_entry(buf: &mut [u8], at: usize, next: u32, name: &str, alloc: i64) {
+        let name_bytes: Vec<u8> = name
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+
+        buf[at..at + 4].copy_from_slice(&next.to_le_bytes());
+        buf[at + 4..at + 8].copy_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        buf[at + 8..at + 16].copy_from_slice(&alloc.to_le_bytes());
+        buf[at + 16..at + 24].copy_from_slice(&alloc.to_le_bytes());
+        buf[at + 24..at + 24 + name_bytes.len()].copy_from_slice(&name_bytes);
+    }
+
+    /// A mutable byte view of an 8-byte-aligned buffer, because `parse_streams` reads entries
+    /// through a pointer to a struct containing `i64`.
+    fn bytes_mut(backing: &mut [u64]) -> &mut [u8] {
+        // SAFETY: the view stays within the allocation and the alignment is guaranteed by
+        // the `u64` element type.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                backing.as_mut_ptr() as *mut u8,
+                backing.len() * std::mem::size_of::<u64>(),
+            )
+        }
+    }
+
+    /// The immutable counterpart.
+    fn bytes(backing: &[u64]) -> &[u8] {
+        // SAFETY: as above, read-only.
+        unsafe {
+            core::slice::from_raw_parts(
+                backing.as_ptr() as *const u8,
+                backing.len() * std::mem::size_of::<u64>(),
+            )
+        }
+    }
+
+    #[test]
+    fn parse_skips_the_unnamed_stream_and_sums_the_named_ones() {
+        let mut backing = vec![0u64; 64];
+        {
+            let raw = bytes_mut(&mut backing);
+            write_entry(raw, 0, 48, "::$DATA", 4096);
+            write_entry(raw, 48, 0, ":zone.identifier", 8192);
+        }
+
+        let facts = parse_streams(bytes(&backing)).expect("a well-formed buffer parses");
+        assert_eq!(facts.count, 1, "the unnamed stream is not a named stream");
+        assert_eq!(facts.bytes, 8192, "only the named stream's allocation");
+    }
+
+    #[test]
+    fn parse_reports_a_file_without_named_streams_as_zero() {
+        let mut backing = vec![0u64; 64];
+        write_entry(bytes_mut(&mut backing), 0, 0, "::$DATA", 4096);
+
+        let facts = parse_streams(bytes(&backing)).expect("a well-formed buffer parses");
+        assert_eq!(facts.count, 0);
+        assert_eq!(facts.bytes, 0);
+    }
+
+    #[test]
+    fn parse_treats_a_truncated_buffer_as_unknown() {
+        let mut backing = vec![0u64; 64];
+        {
+            let raw = bytes_mut(&mut backing);
+            write_entry(raw, 0, 48, "::$DATA", 4096);
+            write_entry(raw, 48, 0, ":zone.identifier", 8192);
+        }
+
+        // Cut inside the second entry's name. A partial count must not look like a full one,
+        // so a truncated buffer is the absence of a measurement, not a smaller number.
+        let facts = parse_streams(&bytes(&backing)[..40]);
+        assert!(facts.is_none(), "a truncated buffer must not parse");
+    }
+
+    #[test]
+    fn a_named_stream_is_measured_on_a_real_file() {
+        let dir = std::env::temp_dir();
+        let name = format!("hfs-streams-test-{}", std::process::id());
+        let file = dir.join(&name);
+        let stream_path = dir.join(format!("{name}:probe"));
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&stream_path);
+
+        // Main data large enough to be non-resident, so its allocation is measurable in
+        // clusters rather than hidden inside the master file table record.
+        std::fs::write(&file, &[0u8; 10_000]).expect("scratch file");
+
+        // A named stream is created by opening a path that names one. On a volume without
+        // alternate streams — anything non-NTFS — there is nothing to test here.
+        let made = std::fs::File::create(&stream_path);
+        let Ok(mut stream) = made else {
+            let _ = std::fs::remove_file(&file);
+            return;
+        };
+        stream.write_all(&[0u8; 5_000]).expect("stream data");
+        drop(stream);
+
+        let facts = query_file(&file).expect("the scratch file opens");
+        let streams = facts
+            .streams
+            .expect("stream enumeration on a file this process just wrote");
+
+        // The stream's allocation is its logical size rounded up to whole clusters, the same
+        // rule the main data follows. A logical-size figure would understate it; a size not
+        // cluster-aligned would mean the measurement is not an allocation at all.
+        let cluster = volume_info(&dir.display().to_string())
+            .map(|v| v.cluster_bytes as u64)
+            .unwrap_or(4096);
+        let expected = (5_000 + cluster - 1) / cluster * cluster;
+
+        assert_eq!(streams.count, 1, "the probe stream is the only named one");
+        assert_eq!(streams.bytes, expected, "allocation, rounded to clusters");
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&stream_path);
+    }
 }
