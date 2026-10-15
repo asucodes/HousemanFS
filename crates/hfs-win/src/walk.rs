@@ -192,6 +192,7 @@ pub struct Walk {
 ///
 /// A terminal command can block until the walk finishes; an interface cannot. The control
 /// lets a caller report progress and stop early, without changing what a walk measures.
+#[derive(Default)]
 pub struct WalkControl<'a> {
     /// Called with (files, directories) scanned so far, each time the file count crosses
     /// another multiple of `every_files`.
@@ -201,16 +202,6 @@ pub struct WalkControl<'a> {
     /// When set, the walk stops at the next directory boundary and returns what it has,
     /// with `cancelled` set. Stopping is observable, never silent.
     pub cancel: Option<&'a AtomicBool>,
-}
-
-impl Default for WalkControl<'_> {
-    fn default() -> Self {
-        Self {
-            progress: None,
-            every_files: 0,
-            cancel: None,
-        }
-    }
 }
 
 /// Walk `root` and everything beneath it, without following reparse points.

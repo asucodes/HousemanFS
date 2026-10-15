@@ -3,18 +3,13 @@
 //! A scan takes minutes; a finder has to answer in milliseconds. The index is what separates
 //! the two, and this module is the bridge between the platform layer and it.
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
 use hfs_core::FileProvenance;
-use hfs_index::{DirRow, FileRow, Index, RefreshReport, ScanMetadata, extension_of};
-use hfs_win::{
-    BackupPrivilege, EntryKind, WalkOptions, WalkSummary, is_elevated, path_facts, volume_info,
-    walk_with,
-};
-
-use crate::human;
+use hfs_core::{human_age, human_bytes_exact as human, windows_ticks_now};
+use hfs_index::{Index, RefreshReport};
+use hfs_win::volume_info;
 
 /// Where the index lives unless told otherwise.
 pub const DEFAULT_INDEX: &str = "housemanfs.db";
@@ -68,204 +63,26 @@ pub fn refresh(db: &str, path: &str, out: &mut String) -> Result<(), String> {
     Ok(())
 }
 
-/// One walk, converted to index rows and scan facts.
-struct CollectedScan {
-    dirs: Vec<DirRow>,
-    files: Vec<FileRow>,
-    meta: ScanMetadata,
-    summary: WalkSummary,
-}
-
-/// One walk, converted to index rows and scan facts.
+/// Walk `path` and convert the entries, printing what the terminal needs to hear.
 ///
-/// Shared by full builds and refreshes: the walk is the expensive part, and both commands
-/// must agree on how entries become rows or their results would silently diverge.
-fn collect(path: &str, out: &mut String) -> Result<CollectedScan, String> {
-    // Same as a scan: ask for the backup privilege, so protected files are measured rather
-    // than estimated from what the directory entry claims.
-    let backup = hfs_win::enable_backup_privilege();
-
-    let volume = volume_info(path).map_err(|e| e.to_string())?;
-
+/// The conversion itself lives in `hfs_import`, shared with every other frontend: both
+/// commands must agree on how entries become rows, or their results would silently
+/// diverge. This function only walks, reports progress in words, and hands rows over.
+fn collect(path: &str, out: &mut String) -> Result<hfs_import::ConvertedScan, String> {
     let _ = writeln!(out, "scanning    {path}");
-    if !backup.is_active() {
+    let mut control = hfs_win::WalkControl::default();
+    let scan = hfs_import::scan_path(path, &mut control)?;
+    if !scan.backup.is_active() {
         let _ = writeln!(
             out,
             "privilege   no backup privilege — protected files are sized by report, not allocation"
         );
     }
-
-    let result = walk_with(
-        path,
-        WalkOptions {
-            collect_entries: true,
-        },
-    )
-    .map_err(|e| e.to_string())?;
-
-    // Every directory gets an identity. Where the filesystem gave us one it is used; where it
-    // did not, a value is derived from the path so that a directory and its children still
-    // agree on who their parent is. Without that, files under a directory whose identity query
-    // failed would be orphaned and silently missing from every query.
-    let mut dir_ids: HashMap<String, [u8; 16]> = HashMap::new();
-    for entry in &result.entries {
-        if entry.kind == EntryKind::Directory {
-            let key = entry.path.display().to_string();
-            let id = entry.id.unwrap_or_else(|| derive_id(&key));
-            dir_ids.insert(key, id);
-        }
-    }
-
-    let mut dirs: Vec<DirRow> = Vec::new();
-    let mut files: Vec<FileRow> = Vec::new();
-
-    // The walk reports everything beneath the root but never the root itself. Without a
-    // root row, entries directly on it would point at a parent that does not exist, and
-    // every query joining files to directories would silently drop them — which is exactly
-    // what happened to single-directory indexes before this row existed.
-    let root_spelling = path.replace('/', "\\");
-    let root_facts = path_facts(path).ok();
-    let root_id = root_facts
-        .as_ref()
-        .and_then(|f| f.id)
-        .unwrap_or_else(|| derive_id(&root_spelling));
-    dir_ids.insert(root_spelling.clone(), root_id);
-    dirs.push(DirRow {
-        id: root_id,
-        parent: None,
-        name: file_name(Path::new(&root_spelling)),
-        path: root_spelling.clone(),
-        depth: 0,
-        index_bytes: root_facts.as_ref().map(|f| f.allocated).unwrap_or(0),
-        stream_bytes: 0,
-        stream_count: 0,
-        provenance: if root_facts.as_ref().is_some_and(|f| f.id.is_some()) {
-            // The root is a directory, and directory streams are not enumerable (see the
-            // walk), so even a fully-queried root is `NoStreams`, never `Full`.
-            FileProvenance::NoStreams
-        } else if root_facts.is_some() {
-            FileProvenance::NoIdentity
-        } else {
-            FileProvenance::Denied
-        },
-    });
-
-    for entry in &result.entries {
-        let path = entry.path.display().to_string();
-        let name = file_name(&entry.path);
-        let parent_key = entry
-            .path
-            .parent()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-
-        match entry.kind {
-            EntryKind::Reparse => {
-                // Recorded during the walk, not stored: it points somewhere else, and counting
-                // its target would double-count.
-            }
-            EntryKind::Directory => {
-                // A denied directory was listed but not entered: its row marks the subtree
-                // as unscanned, so a refresh keeps the rows beneath it instead of reading
-                // the absence as deletion.
-                let provenance = if entry.denied {
-                    FileProvenance::Denied
-                } else if !entry.streams_known {
-                    FileProvenance::NoStreams
-                } else if entry.id.is_none() {
-                    FileProvenance::NoIdentity
-                } else {
-                    FileProvenance::Full
-                };
-                dirs.push(DirRow {
-                    id: dir_ids[&path],
-                    parent: dir_ids.get(&parent_key).copied(),
-                    name,
-                    path: path.clone(),
-                    depth: depth_of(&path),
-                    index_bytes: entry.allocated,
-                    stream_bytes: entry.stream_bytes,
-                    stream_count: entry.stream_count,
-                    provenance,
-                });
-            }
-            EntryKind::File => {
-                let parent = match dir_ids.get(&parent_key).copied() {
-                    Some(id) => id,
-                    // The containing directory's identity was unavailable. Derive one from the
-                    // path so the file still belongs to its parent rather than being dropped.
-                    None => derive_id(&parent_key),
-                };
-                // Denied first: an unreadable file also lacks an identity and enumerated
-                // streams, but "could not be opened" is the truth and the other two codes
-                // would merely describe its symptoms.
-                let provenance = if entry.denied {
-                    FileProvenance::Denied
-                } else if entry.id.is_none() {
-                    FileProvenance::NoIdentity
-                } else if !entry.streams_known {
-                    FileProvenance::NoStreams
-                } else {
-                    FileProvenance::Full
-                };
-                files.push(FileRow {
-                    id: entry.id.unwrap_or_else(|| derive_id(&path)),
-                    parent,
-                    ext: extension_of(&name),
-                    name,
-                    logical: entry.logical,
-                    allocated: entry.allocated,
-                    links: entry.links,
-                    stream_bytes: entry.stream_bytes,
-                    stream_count: entry.stream_count,
-                    provenance,
-                    // Unknown timestamps store as 0, which a later refresh reads as
-                    // "changed" — re-verifying is safe, assuming stasis is not.
-                    modified: entry.modified.unwrap_or(0),
-                });
-            }
-        }
-    }
-
-    let meta = ScanMetadata {
-        // Stored in the walk's spelling, so the recorded root matches the paths beneath it
-        // and `explain` can resolve the root itself.
-        root: root_spelling,
-        filesystem: volume.filesystem.clone(),
-        volume_id: *volume.volume_id.as_bytes(),
-        cluster_bytes: volume.cluster_bytes,
-        total_bytes: volume.total_bytes,
-        free_bytes: volume.free_bytes,
-        elevated: is_elevated(),
-        backup_privilege: match backup {
-            BackupPrivilege::Enabled => "enabled".to_string(),
-            BackupPrivilege::NotHeld => "not-held".to_string(),
-            BackupPrivilege::Failed(code) => format!("failed(os error {code})"),
-        },
-        files: result.summary.files,
-        directories: result.summary.directories,
-        reparse_points: result.summary.reparse_points,
-        stream_bytes: result.summary.stream_bytes,
-        stream_files: result.summary.stream_files,
-        stream_count: result.summary.stream_count,
-        stream_unknown_files: result.summary.stream_unknown_files,
-        denied_directories: result.summary.denied_directories,
-        denied_files: result.summary.denied_files,
-        denied_file_bytes: result.summary.denied_file_bytes,
-        hardlink_groups: result.summary.hardlink_groups,
-        hardlink_extra_names: result.summary.hardlink_extra_names,
-    };
-
-    Ok(CollectedScan {
-        dirs,
-        files,
-        meta,
-        summary: result.summary,
-    })
+    Ok(scan)
 }
 
 /// What a full build stored, in the words the build reports.
-fn print_stored(out: &mut String, scan: &CollectedScan) {
+fn print_stored(out: &mut String, scan: &hfs_import::ConvertedScan) {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
@@ -457,7 +274,11 @@ pub fn explain(db: &str, path: &str, out: &mut String) -> Result<(), String> {
     if record.kind == "file" {
         // An age, not a verdict. Whether old means "abandoned" is a model factor with a
         // confidence attached, not something the index declares.
-        let _ = writeln!(out, "modified    {}", format_age(record.modified));
+        let _ = writeln!(
+            out,
+            "modified    {}",
+            human_age(record.modified, windows_ticks_now())
+        );
     }
     match (record.stream_count, record.provenance) {
         (0, FileProvenance::Full | FileProvenance::NoIdentity) => {
@@ -614,51 +435,6 @@ fn write_stream_note(out: &mut String, bytes: u64, count: u32) {
     }
 }
 
-/// A Windows timestamp as an age. 0 means unknown and is shown as unknown — "a long time
-/// ago" would be a guess wearing a measurement's clothes.
-fn format_age(modified: i64) -> String {
-    if modified <= 0 {
-        return "unknown".to_string();
-    }
-    let now = windows_ticks_now();
-    if modified > now {
-        return "in the future — the clock moved, not the file".to_string();
-    }
-    const TICK: i64 = 10_000_000;
-    let seconds = (now - modified) / TICK;
-    const MINUTE: i64 = 60;
-    const HOUR: i64 = 3_600;
-    const DAY: i64 = 86_400;
-    const MONTH: i64 = 30 * DAY;
-    const YEAR: i64 = 365 * DAY;
-    let (value, unit) = if seconds < MINUTE {
-        (seconds, "second")
-    } else if seconds < HOUR {
-        (seconds / MINUTE, "minute")
-    } else if seconds < DAY {
-        (seconds / HOUR, "hour")
-    } else if seconds < MONTH {
-        (seconds / DAY, "day")
-    } else if seconds < YEAR {
-        (seconds / MONTH, "month")
-    } else {
-        (seconds / YEAR, "year")
-    };
-    format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
-}
-
-/// Current time in Windows ticks, without depending on a datetime crate for one call.
-///
-/// Full precision matters: truncating to whole seconds would leave the clock up to a second
-/// behind a file written "now", and every fresh file would read as modified in the future.
-pub(crate) fn windows_ticks_now() -> i64 {
-    const UNIX_TO_WINDOWS_TICKS: u128 = 11_644_473_600 * 10_000_000;
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.as_nanos() / 100 + UNIX_TO_WINDOWS_TICKS) as i64)
-        .unwrap_or(0)
-}
-
 /// Split `>=500MB` into its operator and amount.
 fn split_comparison(rest: &str) -> Option<(&str, &str)> {
     for op in [">=", "<=", ">", "<"] {
@@ -761,7 +537,7 @@ pub fn ask(db: &str, raw: &str, out: &mut String) -> Result<(), String> {
             out,
             "{:>12}  {:>12}  {}",
             human(hit.allocated),
-            format_age(hit.modified),
+            human_age(hit.modified, windows_ticks_now()),
             truncate(&hit.path, 90)
         );
         if hit.links > 1 {
@@ -954,7 +730,7 @@ fn evidence(kind: &hfs_model::SuggestionKind, modified: i64) -> String {
         SuggestionKind::StaleArchive { allocated, .. } => format!(
             "occupies {}, last written {}",
             human(*allocated),
-            format_age(modified)
+            human_age(modified, windows_ticks_now())
         ),
         SuggestionKind::BuildOutput { allocated } => {
             format!("occupies {}, regenerable by rebuilding", human(*allocated))
@@ -1067,41 +843,6 @@ fn noun(count: u64) -> &'static str {
     if count == 1 { "file" } else { "files" }
 }
 
-/// The final component of a path.
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
-/// Depth of a Windows path, measured in separators.
-///
-/// Used only to order directories so subtree totals can be rolled up from the deepest first.
-fn depth_of(path: &str) -> u32 {
-    path.trim_end_matches(['\\', '/'])
-        .matches(['\\', '/'])
-        .count() as u32
-}
-
-/// A stable 16-byte value derived from text, used only when the filesystem did not supply an
-/// identity. Two different seeds so the result is wider than one 64-bit hash.
-fn derive_id(text: &str) -> [u8; 16] {
-    fn fnv(bytes: &[u8], seed: u64) -> u64 {
-        let mut h = seed;
-        for b in bytes {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x0100_0000_01b3);
-        }
-        h
-    }
-    let a = fnv(text.as_bytes(), 0xcbf2_9ce4_8422_2325);
-    let b = fnv(text.as_bytes(), 0x9e37_79b9_7f4a_7c15);
-    let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&a.to_le_bytes());
-    out[8..].copy_from_slice(&b.to_le_bytes());
-    out
-}
-
 /// Shorten a path for display, keeping the beginning and the end.
 ///
 /// Deep paths are common and the middle is rarely the interesting part.
@@ -1121,16 +862,17 @@ fn truncate(path: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hfs_core::TICKS_PER_SECOND;
 
     #[test]
     fn ages_read_as_ages() {
-        assert_eq!(format_age(0), "unknown");
-        assert_eq!(format_age(-5), "unknown");
+        assert_eq!(human_age(0, 0), "unknown");
+        assert_eq!(human_age(-5, 0), "unknown");
         let now = windows_ticks_now();
         // A file written this instant is seconds old, never from the future.
-        assert!(format_age(now - 30 * 10_000_000).starts_with("30 second"));
-        assert!(format_age(now - 3 * 86_400 * 10_000_000).starts_with("3 day"));
-        assert!(format_age(now - 400 * 86_400 * 10_000_000).starts_with("1 year"));
+        assert!(human_age(now - 30 * TICKS_PER_SECOND, now).starts_with("30 second"));
+        assert!(human_age(now - 3 * 86_400 * TICKS_PER_SECOND, now).starts_with("3 day"));
+        assert!(human_age(now - 400 * 86_400 * TICKS_PER_SECOND, now).starts_with("1 year"));
     }
 
     #[test]
@@ -1140,7 +882,7 @@ mod tests {
         let first = windows_ticks_now();
         let second = windows_ticks_now();
         assert!(second >= first);
-        assert!(second % 10_000_000 != 0 || first % 10_000_000 != 0);
+        assert!(second % TICKS_PER_SECOND != 0 || first % TICKS_PER_SECOND != 0);
     }
 
     #[test]

@@ -8,7 +8,7 @@ mod index;
 use std::fmt::Write as _;
 use std::process::ExitCode;
 
-use hfs_core::{Accounting, Denied, Reconciliation, reconcile};
+use hfs_core::{Accounting, Denied, Reconciliation, human_bytes_exact as human, reconcile};
 use hfs_win::{
     BackupPrivilege, WalkSummary, enable_backup_privilege, holds_backup_privilege, is_elevated,
     mft_allocation, ntfs_metadata, system_files, volume_info, walk,
@@ -605,23 +605,4 @@ fn is_volume_root(path: &str) -> bool {
     let trimmed = path.trim_end_matches(['\\', '/']);
     let bytes = trimmed.as_bytes();
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
-}
-
-/// Format a byte count using binary units, labelled honestly.
-///
-/// Windows displays binary units but labels them GB/TB, which is why a "500 GB" drive shows as
-/// 465 GB. Labelling them GiB costs nothing and avoids repeating that confusion.
-pub(crate) fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.2} {} ({bytes} bytes)", UNITS[unit])
-    }
 }

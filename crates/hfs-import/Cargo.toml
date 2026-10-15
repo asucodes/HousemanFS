@@ -1,0 +1,13 @@
+[package]
+name = "hfs-import"
+description = "Walk-to-index conversion shared by every frontend. One walk becomes rows the same way everywhere."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hfs-core = { path = "../hfs-core" }
+hfs-index = { path = "../hfs-index" }
+hfs-win = { path = "../hfs-win" }

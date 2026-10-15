@@ -290,6 +290,7 @@ name = "hfs-cli"
 version = "0.0.0"
 dependencies = [
  "hfs-core",
+ "hfs-import",
  "hfs-index",
  "hfs-model",
  "hfs-tui",
@@ -300,6 +301,15 @@ dependencies = [
 [[package]]
 name = "hfs-core"
 version = "0.0.0"
+
+[[package]]
+name = "hfs-import"
+version = "0.0.0"
+dependencies = [
+ "hfs-core",
+ "hfs-index",
+ "hfs-win",
+]
 
 [[package]]
 name = "hfs-index"
