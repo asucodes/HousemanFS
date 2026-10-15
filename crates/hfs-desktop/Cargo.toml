@@ -1,0 +1,23 @@
+[package]
+name = "hfs-desktop"
+description = "The desktop client. Renders the index; decides nothing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "housemanfs-desktop"
+path = "src/main.rs"
+
+[dependencies]
+hfs-core = { path = "../hfs-core" }
+hfs-import = { path = "../hfs-import" }
+hfs-index = { path = "../hfs-index" }
+hfs-model = { path = "../hfs-model" }
+hfs-win = { path = "../hfs-win" }
+eframe = "0.31"
+egui = "0.31"
+rfd = "0.15"
+serde_json = "1.0"

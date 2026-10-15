@@ -8,7 +8,7 @@ mod index;
 use std::fmt::Write as _;
 use std::process::ExitCode;
 
-use hfs_core::{RESIDUAL_TOLERANCE, Reconciliation, human_bytes_exact as human};
+use hfs_core::{RESIDUAL_TOLERANCE, Reconciliation, human_bytes_exact as human, is_volume_root};
 use hfs_win::{
     BackupPrivilege, WalkSummary, enable_backup_privilege, holds_backup_privilege, is_elevated,
     volume_info, walk,
@@ -551,11 +551,4 @@ fn reconcile_volume(path: &str, s: &WalkSummary, out: &mut String) -> Result<(),
     }
 
     Ok(())
-}
-
-/// Whether a path refers to a whole volume, e.g. `C:` or `D:\`.
-fn is_volume_root(path: &str) -> bool {
-    let trimmed = path.trim_end_matches(['\\', '/']);
-    let bytes = trimmed.as_bytes();
-    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }

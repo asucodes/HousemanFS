@@ -31,6 +31,27 @@ pub fn human_bytes_exact(bytes: u64) -> String {
 /// Ticks per second in Windows time.
 pub const TICKS_PER_SECOND: i64 = 10_000_000;
 
+/// Parse `500MB` into bytes. Units are binary (MB = 1024²), matching how the tool reports
+/// sizes everywhere else; a bare number means bytes. Stated once so the CLI's ask parser
+/// and the desktop's size fields cannot disagree about what a gigabyte is.
+pub fn parse_byte_size(amount: &str) -> Option<u64> {
+    let lower = amount.to_ascii_lowercase();
+    let (digits, factor) = if let Some(n) = lower.strip_suffix("tb") {
+        (n, 1u64 << 40)
+    } else if let Some(n) = lower.strip_suffix("gb") {
+        (n, 1u64 << 30)
+    } else if let Some(n) = lower.strip_suffix("mb") {
+        (n, 1u64 << 20)
+    } else if let Some(n) = lower.strip_suffix("kb") {
+        (n, 1u64 << 10)
+    } else if let Some(n) = lower.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    digits.parse::<u64>().ok()?.checked_mul(factor)
+}
+
 /// Current time in Windows ticks (100ns since 1601-01-01), at full precision.
 ///
 /// Truncating to whole seconds would leave the clock up to a second behind a file written

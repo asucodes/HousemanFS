@@ -90,8 +90,12 @@ model on a wrong index produces confident wrong answers faster, which is worse t
   frontend would compile into the same IR, which bounds what it can express.
 - `explain` — for any figure, show the measurement behind it. **Done** for indexed paths:
   `housemanfs explain <path>` reports each figure with the query that produced it, plus age.
-- A minimal interface. Read-only, and visibly so. **Done:** the finder renders the index
-  and cannot initiate an action.
+- A minimal interface. Read-only, and visibly so. **Done twice:** the finder renders the
+  index in a terminal and cannot initiate an action, and the desktop client
+  (`housemanfs-desktop`) offers folder picking, background scanning with progress and
+  cancel, a residual dashboard, tables, an allocated-size treemap, structured search,
+  evidence panels and gated suggestions — rendering the same index through the same
+  shared conversions, deciding nothing.
 
 **Exit criteria.** A user can point it at a real drive and get a correct, inspectable answer to
 "where did my space go", including an honest reclaim figure.

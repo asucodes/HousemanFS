@@ -206,6 +206,8 @@ pub fn scan_path(path: &str, control: &mut WalkControl) -> Result<ConvertedScan,
         denied_file_bytes: result.summary.denied_file_bytes,
         hardlink_groups: result.summary.hardlink_groups,
         hardlink_extra_names: result.summary.hardlink_extra_names,
+        slack_bytes: result.summary.slack_bytes,
+        directory_bytes: result.summary.directory_bytes,
     };
 
     Ok(ConvertedScan {

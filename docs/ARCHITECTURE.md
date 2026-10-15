@@ -18,18 +18,22 @@ This is the seam that makes the whole thing testable, and it is worth protecting
 hfs-core      pure data model — identity, accounting, claims. No I/O, no platform code.
 hfs-index     persistence and queries (SQLite). No platform code.
 hfs-model     the decision-model boundary: state assembly, typed questions, calibration.
+hfs-import    walk-to-index conversion shared by every frontend. No output.
 hfs-win       the ONLY crate that talks to Windows. All FFI and unsafe lives here.
-hfs-cli       the user-facing entry point.
-hfs-tui       the minimal interface. Renders; decides nothing.
+hfs-cli       the terminal entry point.
+hfs-tui       the minimal terminal interface. Renders; decides nothing.
+hfs-desktop   the windowed interface. Renders; decides nothing. Scans on a worker thread.
 ```
 
 Rules that keep this honest:
 
-- `hfs-core`, `hfs-index` and `hfs-model` contain no operating-system code and are testable on
-  any platform.
+- `hfs-core`, `hfs-index`, `hfs-model` and `hfs-import` contain no operating-system code
+  and are testable on any platform.
 - `unsafe` is confined to `hfs-win`. Any exception needs a written justification.
-- The interface layer opens no files and holds no volume handles. It renders values it is
-  given, and cannot initiate an action.
+- The interface layers (`hfs-cli`, `hfs-tui`, `hfs-desktop`) open no files for measurement
+  and hold no volume handles. They render values they are given, and cannot initiate an
+  action. The desktop's only process spawn is revealing a path in Explorer — navigation,
+  not modification, and it touches nothing on the volume.
 
 ## The read path
 

@@ -10,3 +10,7 @@ repository.workspace = true
 [dependencies]
 hfs-core = { path = "../hfs-core" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# The versioned JSON export is this crate's extension surface (D11): the machine-readable
+# contract anything may build on. Owned here so every frontend publishes byte-identical
+# output; kept to hand-built shapes, never derived, so additions stay deliberate.
+serde_json = "1.0"

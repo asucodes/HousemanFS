@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use hfs_core::FileProvenance;
-use hfs_core::{human_age, human_bytes_exact as human, windows_ticks_now};
+use hfs_core::{human_age, human_bytes_exact as human, parse_byte_size, windows_ticks_now};
 use hfs_index::{Index, RefreshReport};
 use hfs_win::volume_info;
 
@@ -334,69 +334,7 @@ pub fn explain(db: &str, path: &str, out: &mut String) -> Result<(), String> {
 /// me every row".
 pub fn export(db: &str, limit: u32, out: &mut String) -> Result<(), String> {
     let index = open(db)?;
-    let scan = index.scan_metadata();
-    let summary = index.summary().map_err(|e| e.to_string())?;
-    let files = index.largest_files(limit).map_err(|e| e.to_string())?;
-    let dirs = index.largest_dirs(limit).map_err(|e| e.to_string())?;
-    let ext = index.by_extension(limit).map_err(|e| e.to_string())?;
-
-    // Built by hand rather than derived: the contract shape is a compatibility promise, and
-    // spelling each field keeps additions deliberate instead of automatic.
-    let document = serde_json::json!({
-        "contract": "housemanfs-export",
-        "contract_version": 1,
-        "schema_version": hfs_index::SCHEMA_VERSION,
-        "meta": {
-            "root": scan.root,
-            "filesystem": scan.filesystem,
-            "cluster_bytes": scan.cluster_bytes,
-            "total_bytes": scan.total_bytes,
-            "free_bytes": scan.free_bytes,
-        },
-        "scan": {
-            "elevated": scan.elevated,
-            "backup_privilege": scan.backup_privilege,
-            "files": scan.files,
-            "directories": scan.directories,
-            "reparse_points": scan.reparse_points,
-            "stream_bytes": scan.stream_bytes,
-            "stream_files": scan.stream_files,
-            "stream_count": scan.stream_count,
-            "stream_unknown_files": scan.stream_unknown_files,
-            "denied_directories": scan.denied_directories,
-            "denied_files": scan.denied_files,
-            "denied_file_bytes": scan.denied_file_bytes,
-            "hardlink_groups": scan.hardlink_groups,
-            "hardlink_extra_names": scan.hardlink_extra_names,
-        },
-        "summary": {
-            "files": summary.files,
-            "directories": summary.directories,
-            "logical": summary.logical,
-            "allocated": summary.allocated,
-            "stream_bytes": summary.stream_bytes,
-        },
-        "largest_files": files.iter().map(|hit| serde_json::json!({
-            "path": hit.path,
-            "logical": hit.logical,
-            "allocated": hit.allocated,
-            "links": hit.links,
-            "stream_bytes": hit.stream_bytes,
-            "stream_count": hit.stream_count,
-            "provenance": hit.provenance.as_str(),
-        })).collect::<Vec<_>>(),
-        "largest_dirs": dirs.iter().map(|hit| serde_json::json!({
-            "path": hit.path,
-            "allocated": hit.allocated,
-            "streams": hit.streams,
-            "files": hit.files,
-        })).collect::<Vec<_>>(),
-        "by_extension": ext.iter().map(|(name, allocated, count)| serde_json::json!({
-            "ext": name,
-            "allocated": allocated,
-            "files": count,
-        })).collect::<Vec<_>>(),
-    });
+    let document = index.export_snapshot(limit).map_err(|e| e.to_string())?;
 
     out.push_str(&serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?);
     out.push('\n');
@@ -426,26 +364,6 @@ fn split_comparison(rest: &str) -> Option<(&str, &str)> {
         }
     }
     None
-}
-
-/// Parse `500MB` into bytes. Units are binary (MB = 1024²), matching how the tool reports
-/// sizes everywhere else; a bare number means bytes.
-fn parse_size(amount: &str) -> Option<u64> {
-    let lower = amount.to_ascii_lowercase();
-    let (digits, factor) = if let Some(n) = lower.strip_suffix("tb") {
-        (n, 1u64 << 40)
-    } else if let Some(n) = lower.strip_suffix("gb") {
-        (n, 1u64 << 30)
-    } else if let Some(n) = lower.strip_suffix("mb") {
-        (n, 1u64 << 20)
-    } else if let Some(n) = lower.strip_suffix("kb") {
-        (n, 1u64 << 10)
-    } else if let Some(n) = lower.strip_suffix('b') {
-        (n, 1)
-    } else {
-        (lower.as_str(), 1)
-    };
-    digits.parse::<u64>().ok()?.checked_mul(factor)
 }
 
 /// Parse `30d` into Windows ticks. Months are 30 days and years 365: approximate, and the
@@ -553,7 +471,7 @@ fn parse_ask(raw: &str) -> Result<hfs_index::AskQuery, String> {
             let (op, amount) = split_comparison(rest).ok_or_else(|| {
                 format!("don't understand {word:?}. Size looks like size>500MB. {HELP}")
             })?;
-            let bytes = parse_size(amount).ok_or_else(|| {
+            let bytes = parse_byte_size(amount).ok_or_else(|| {
                 format!("don't understand {amount:?}. Sizes look like 500MB or 2GB. {HELP}")
             })?;
             match op {
@@ -634,7 +552,7 @@ pub fn suggest(
         },
         min_bytes: match min_bytes {
             None => RuleConfig::default().min_bytes,
-            Some(raw) => parse_size(raw)
+            Some(raw) => parse_byte_size(raw)
                 .ok_or_else(|| format!("don't understand {raw:?} as a size; try 1GB"))?,
         },
         without: without

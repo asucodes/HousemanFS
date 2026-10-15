@@ -119,7 +119,7 @@ pub struct Index {
 /// was measured, how much was unreadable, and under what privilege. Every figure here was
 /// true at scan time; the live volume may have changed since, which is why suggestions built
 /// on an index must re-verify before acting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ScanMetadata {
     pub root: String,
     pub filesystem: String,
@@ -147,6 +147,10 @@ pub struct ScanMetadata {
     pub denied_file_bytes: u64,
     pub hardlink_groups: u64,
     pub hardlink_extra_names: u64,
+    /// Bytes lost to rounding files up to whole clusters, and bytes in directory index
+    /// blocks. Stored so a dashboard can reconcile from the index alone, without re-walking.
+    pub slack_bytes: u64,
+    pub directory_bytes: u64,
 }
 
 /// One directory, as recorded.
@@ -392,6 +396,8 @@ impl Index {
                 "scan_hardlink_extra_names",
                 meta.hardlink_extra_names.to_string(),
             ),
+            ("scan_slack_bytes", meta.slack_bytes.to_string()),
+            ("scan_directory_bytes", meta.directory_bytes.to_string()),
         ] {
             tx.execute(
                 "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -935,6 +941,8 @@ impl Index {
             denied_file_bytes: number("scan_denied_file_bytes"),
             hardlink_groups: number("scan_hardlink_groups"),
             hardlink_extra_names: number("scan_hardlink_extra_names"),
+            slack_bytes: number("scan_slack_bytes"),
+            directory_bytes: number("scan_directory_bytes"),
         }
     }
 
@@ -1131,6 +1139,81 @@ impl Index {
         })?;
         rows.collect()
     }
+
+    /// The index as versioned JSON: the extension surface.
+    ///
+    /// Anything may build on this output in any language, without running code inside a
+    /// process that can read the whole disk. The contract is versioned
+    /// (`contract_version`) separately from the storage schema (`schema_version`): the
+    /// storage may change how it keeps facts, but this shape changes only deliberately.
+    /// This is a snapshot — the largest lists are capped — not a full dump; it answers
+    /// "what does the index say", not "give me every row".
+    ///
+    /// Built by hand rather than derived: the contract shape is a compatibility promise,
+    /// and spelling each field keeps additions deliberate instead of automatic.
+    pub fn export_snapshot(&self, limit: u32) -> rusqlite::Result<serde_json::Value> {
+        let scan = self.scan_metadata();
+        let summary = self.summary()?;
+        let files = self.largest_files(limit)?;
+        let dirs = self.largest_dirs(limit)?;
+        let ext = self.by_extension(limit)?;
+
+        Ok(serde_json::json!({
+            "contract": "housemanfs-export",
+            "contract_version": 1,
+            "schema_version": SCHEMA_VERSION,
+            "meta": {
+                "root": scan.root,
+                "filesystem": scan.filesystem,
+                "cluster_bytes": scan.cluster_bytes,
+                "total_bytes": scan.total_bytes,
+                "free_bytes": scan.free_bytes,
+            },
+            "scan": {
+                "elevated": scan.elevated,
+                "backup_privilege": scan.backup_privilege,
+                "files": scan.files,
+                "directories": scan.directories,
+                "reparse_points": scan.reparse_points,
+                "stream_bytes": scan.stream_bytes,
+                "stream_files": scan.stream_files,
+                "stream_count": scan.stream_count,
+                "stream_unknown_files": scan.stream_unknown_files,
+                "denied_directories": scan.denied_directories,
+                "denied_files": scan.denied_files,
+                "denied_file_bytes": scan.denied_file_bytes,
+                "hardlink_groups": scan.hardlink_groups,
+                "hardlink_extra_names": scan.hardlink_extra_names,
+            },
+            "summary": {
+                "files": summary.files,
+                "directories": summary.directories,
+                "logical": summary.logical,
+                "allocated": summary.allocated,
+                "stream_bytes": summary.stream_bytes,
+            },
+            "largest_files": files.iter().map(|hit| serde_json::json!({
+                "path": hit.path,
+                "logical": hit.logical,
+                "allocated": hit.allocated,
+                "links": hit.links,
+                "stream_bytes": hit.stream_bytes,
+                "stream_count": hit.stream_count,
+                "provenance": hit.provenance.as_str(),
+            })).collect::<Vec<_>>(),
+            "largest_dirs": dirs.iter().map(|hit| serde_json::json!({
+                "path": hit.path,
+                "allocated": hit.allocated,
+                "streams": hit.streams,
+                "files": hit.files,
+            })).collect::<Vec<_>>(),
+            "by_extension": ext.iter().map(|(name, allocated, count)| serde_json::json!({
+                "ext": name,
+                "allocated": allocated,
+                "files": count,
+            })).collect::<Vec<_>>(),
+        }))
+    }
 }
 
 /// Join a directory path and a name without doubling the separator.
@@ -1240,6 +1323,8 @@ mod tests {
             denied_file_bytes: 0,
             hardlink_groups: 0,
             hardlink_extra_names: 0,
+            slack_bytes: 0,
+            directory_bytes: 0,
         }
     }
 

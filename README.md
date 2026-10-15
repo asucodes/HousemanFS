@@ -67,6 +67,20 @@ HousemanFS is a Rust workspace. Platform-independent logic lives in pure crates 
 tested anywhere; all operating-system interaction is confined to a platform crate, so that the
 data model is not entangled with Windows APIs.
 
+Two interfaces read the same index and share every conversion: the terminal commands and
+the desktop client. Neither duplicates what the other computes — formatting, walk-to-row
+conversion, reconciliation, provenance words and suggestion evidence each live in exactly
+one shared crate.
+
+```
+housemanfs          the terminal: scan, index, ask, explain, suggest, export
+housemanfs-desktop  the window: folder pick, background scan, dashboard, treemap
+```
+
+Run the desktop client with `cargo run -p hfs-desktop --release`, or launch
+`target/release/housemanfs-desktop.exe` directly. It needs no installation and no
+network: one binary, local only, like everything else here.
+
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 [`docs/DECISIONS.md`](docs/DECISIONS.md) for the reasoning behind each choice.
 

@@ -29,7 +29,9 @@ pub mod provenance;
 
 pub use accounting::{Accounting, Denied, RESIDUAL_TOLERANCE, Reconciliation, reconcile};
 pub use bytes::{ExtentBytes, Ownership};
-pub use format::{TICKS_PER_SECOND, human_age, human_bytes, human_bytes_exact, windows_ticks_now};
+pub use format::{
+    TICKS_PER_SECOND, human_age, human_bytes, human_bytes_exact, parse_byte_size, windows_ticks_now,
+};
 pub use identity::{FileId, FileKey, VolumeId};
-pub use names::extension_of;
+pub use names::{extension_of, is_volume_root};
 pub use provenance::FileProvenance;
