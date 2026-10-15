@@ -11,7 +11,8 @@
 //! No platform code lives here, so the index is testable anywhere.
 
 use hfs_core::FileProvenance;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 /// Schema version. Bump only with a migration, never in place.
 ///
@@ -203,6 +204,48 @@ pub struct DirHit {
     pub allocated: u64,
     pub streams: u64,
     pub files: u64,
+}
+
+/// A structured question over the index: the typed intermediate representation.
+///
+/// Queries cross the API boundary in this shape, never as SQL strings — the index owns all
+/// SQL, so a caller (a hand-written parser today, a local model tomorrow) can express only
+/// what this struct can hold. That bound is deliberate: it is what will make a future
+/// natural-language frontend unable to ask for anything the index was not built to answer.
+#[derive(Debug, Clone, Default)]
+pub struct AskQuery {
+    /// Minimum occupied size, inclusive.
+    pub min_allocated: Option<u64>,
+    /// Maximum occupied size, inclusive.
+    pub max_allocated: Option<u64>,
+    /// Extensions to include, lowercased without dots. Empty means all.
+    pub exts: Vec<String>,
+    /// Name substring, matched literally.
+    pub name: Option<String>,
+    /// Files last written before this timestamp (Windows ticks).
+    pub older_than: Option<i64>,
+    /// Files last written at or after this timestamp (Windows ticks).
+    pub newer_than: Option<i64>,
+    /// Only files with more than one name.
+    pub shared_only: bool,
+    /// Only files carrying named streams.
+    pub streams_only: bool,
+    pub limit: u32,
+}
+
+impl AskQuery {
+    /// Whether the query narrows anything at all. An empty query is "largest files", which
+    /// is a fine question and needs no apology — but the caller should know.
+    pub fn is_empty(&self) -> bool {
+        self.min_allocated.is_none()
+            && self.max_allocated.is_none()
+            && self.exts.is_empty()
+            && self.name.is_none()
+            && self.older_than.is_none()
+            && self.newer_than.is_none()
+            && !self.shared_only
+            && !self.streams_only
+    }
 }
 
 /// Aggregate totals for the indexed volume.
@@ -972,26 +1015,10 @@ impl Index {
 
     /// The largest files by occupied size.
     pub fn largest_files(&self, limit: u32) -> rusqlite::Result<Vec<FileHit>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT d.path, f.name, f.logical, f.allocated, f.links,
-                    f.stream_bytes, f.stream_count, f.provenance, f.modified
-             FROM files f JOIN dirs d ON f.parent = d.id
-             ORDER BY f.allocated DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], |row| {
-            let dir: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            Ok(FileHit {
-                path: join_path(&dir, &name),
-                logical: row.get::<_, i64>(2)? as u64,
-                allocated: row.get::<_, i64>(3)? as u64,
-                links: row.get::<_, u32>(4)?,
-                stream_bytes: row.get::<_, i64>(5)? as u64,
-                stream_count: row.get::<_, u32>(6)?,
-                provenance: FileProvenance::parse(&row.get::<_, String>(7)?),
-                modified: row.get::<_, i64>(8)?,
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!(
+            "{FILE_COLUMNS} ORDER BY f.allocated DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(params![limit], file_hit)?;
         rows.collect()
     }
 
@@ -1018,32 +1045,68 @@ impl Index {
     /// `100%` does not become a pattern. A search box that reinterprets its input is a small
     /// dishonesty, and this tool has a policy about those.
     pub fn search_name(&self, term: &str, limit: u32) -> rusqlite::Result<Vec<FileHit>> {
-        let escaped = term
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("%{escaped}%");
-        let mut stmt = self.conn.prepare(
-            "SELECT d.path, f.name, f.logical, f.allocated, f.links,
-                    f.stream_bytes, f.stream_count, f.provenance, f.modified
-             FROM files f JOIN dirs d ON f.parent = d.id
-             WHERE f.name LIKE ?1 ESCAPE '\\'
-             ORDER BY f.allocated DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![pattern, limit], |row| {
-            let dir: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            Ok(FileHit {
-                path: join_path(&dir, &name),
-                logical: row.get::<_, i64>(2)? as u64,
-                allocated: row.get::<_, i64>(3)? as u64,
-                links: row.get::<_, u32>(4)?,
-                stream_bytes: row.get::<_, i64>(5)? as u64,
-                stream_count: row.get::<_, u32>(6)?,
-                provenance: FileProvenance::parse(&row.get::<_, String>(7)?),
-                modified: row.get::<_, i64>(8)?,
-            })
-        })?;
+        let pattern = format!("%{}%", escape_like(term));
+        let mut stmt = self.conn.prepare(&format!(
+            "{FILE_COLUMNS} WHERE f.name LIKE ?1 ESCAPE '\\'
+             ORDER BY f.allocated DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![pattern, limit], file_hit)?;
+        rows.collect()
+    }
+
+    /// Answer a structured question: every clause becomes one parameterized predicate.
+    ///
+    /// The SQL is assembled, never interpolated: values travel as parameters, so a hostile
+    /// or malformed term cannot escape its clause. Unknown timestamps never match an age
+    /// predicate — "older than a year" must not return files whose age was never measured.
+    pub fn ask(&self, query: &AskQuery) -> rusqlite::Result<Vec<FileHit>> {
+        let mut sql = FILE_COLUMNS.to_string();
+        let mut clauses: Vec<String> = Vec::new();
+        let mut values: Vec<Value> = Vec::new();
+
+        if let Some(min) = query.min_allocated {
+            clauses.push("f.allocated >= ?".to_string());
+            values.push(Value::Integer(min as i64));
+        }
+        if let Some(max) = query.max_allocated {
+            clauses.push("f.allocated <= ?".to_string());
+            values.push(Value::Integer(max as i64));
+        }
+        if !query.exts.is_empty() {
+            let holes = vec!["?"; query.exts.len()].join(",");
+            clauses.push(format!("f.ext IN ({holes})"));
+            for ext in &query.exts {
+                values.push(Value::Text(ext.clone()));
+            }
+        }
+        if let Some(name) = &query.name {
+            clauses.push("f.name LIKE ? ESCAPE '\\'".to_string());
+            values.push(Value::Text(format!("%{}%", escape_like(name))));
+        }
+        if let Some(older) = query.older_than {
+            clauses.push("f.modified > 0 AND f.modified < ?".to_string());
+            values.push(Value::Integer(older));
+        }
+        if let Some(newer) = query.newer_than {
+            clauses.push("f.modified >= ?".to_string());
+            values.push(Value::Integer(newer));
+        }
+        if query.shared_only {
+            clauses.push("f.links > 1".to_string());
+        }
+        if query.streams_only {
+            clauses.push("f.stream_count > 0".to_string());
+        }
+
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY f.allocated DESC LIMIT ?");
+        values.push(Value::Integer(i64::from(query.limit)));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), file_hit)?;
         rows.collect()
     }
 
@@ -1081,6 +1144,37 @@ fn join_path(dir: &str, name: &str) -> String {
         format!("{dir}\\{name}")
     }
 }
+
+/// Escape a literal for a LIKE pattern. SQL wildcards in the term are data, not pattern —
+/// a search box that reinterprets its input is a small dishonesty, and this tool has a
+/// policy about those.
+fn escape_like(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// One file row from a joined files+dirs query. Every file listing shares these columns in
+/// this order, so they share one mapper rather than three copies that could drift.
+fn file_hit(row: &rusqlite::Row) -> rusqlite::Result<FileHit> {
+    let dir: String = row.get(0)?;
+    let name: String = row.get(1)?;
+    Ok(FileHit {
+        path: join_path(&dir, &name),
+        logical: row.get::<_, i64>(2)? as u64,
+        allocated: row.get::<_, i64>(3)? as u64,
+        links: row.get::<_, u32>(4)?,
+        stream_bytes: row.get::<_, i64>(5)? as u64,
+        stream_count: row.get::<_, u32>(6)?,
+        provenance: FileProvenance::parse(&row.get::<_, String>(7)?),
+        modified: row.get::<_, i64>(8)?,
+    })
+}
+
+/// The shared SELECT list behind every file listing, matching [`file_hit`].
+const FILE_COLUMNS: &str = "SELECT d.path, f.name, f.logical, f.allocated, f.links,
+        f.stream_bytes, f.stream_count, f.provenance, f.modified
+    FROM files f JOIN dirs d ON f.parent = d.id";
 
 /// Normalise a caller-supplied path to the walk's spelling: backslash separators, no
 /// trailing separator except on a volume root.
@@ -1428,6 +1522,108 @@ CREATE TABLE files (
         assert_eq!(largest[0].modified, 0, "no timestamp was ever recorded");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ask_answers_structured_questions() {
+        use super::AskQuery;
+
+        const DAY: i64 = 86_400 * 10_000_000;
+        const NOW: i64 = 134_000_000_000_000_000;
+
+        let mut index = empty();
+        let root = [1u8; 16];
+        let dir = root_dir();
+        let files = [
+            FileRow {
+                id: [2u8; 16],
+                parent: root,
+                name: "old.iso".to_string(),
+                ext: "iso".to_string(),
+                logical: 1_000,
+                allocated: 8_192,
+                links: 1,
+                stream_bytes: 0,
+                stream_count: 0,
+                provenance: FileProvenance::Full,
+                modified: NOW - 400 * DAY,
+            },
+            FileRow {
+                id: [3u8; 16],
+                parent: root,
+                name: "fresh.iso".to_string(),
+                ext: "iso".to_string(),
+                logical: 1_000,
+                allocated: 16_384,
+                links: 2,
+                stream_bytes: 0,
+                stream_count: 0,
+                provenance: FileProvenance::Full,
+                modified: NOW - 2 * DAY,
+            },
+            FileRow {
+                id: [4u8; 16],
+                parent: root,
+                name: "notes.txt".to_string(),
+                ext: "txt".to_string(),
+                logical: 10,
+                allocated: 4_096,
+                links: 1,
+                stream_bytes: 0,
+                stream_count: 0,
+                provenance: FileProvenance::Full,
+                // Never measured: must not match any age predicate.
+                modified: 0,
+            },
+        ];
+        index
+            .write_scan(&meta(), std::iter::once(&dir), files.iter())
+            .unwrap();
+
+        // Size plus extension.
+        let hits = index
+            .ask(&AskQuery {
+                min_allocated: Some(8_000),
+                exts: vec!["iso".to_string()],
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+
+        // Age: the unmeasured file is excluded, not guessed about.
+        let hits = index
+            .ask(&AskQuery {
+                older_than: Some(NOW - 365 * DAY),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("old.iso"));
+
+        // Shared names only.
+        let hits = index
+            .ask(&AskQuery {
+                shared_only: true,
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("fresh.iso"));
+
+        // Everything combined, largest first.
+        let hits = index
+            .ask(&AskQuery {
+                name: Some("iso".to_string()),
+                newer_than: Some(NOW - 30 * DAY),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("fresh.iso"));
     }
 
     #[test]

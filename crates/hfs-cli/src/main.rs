@@ -26,6 +26,8 @@ usage:
   housemanfs top [n]        largest files in the index (default 20)
   housemanfs dirs [n]       largest directory subtrees (default 20)
   housemanfs find <term>    files whose name contains <term>
+  housemanfs ask \"<query>\" structured questions: size>500MB ext:iso older than 1y
+                  shared streams name:backup videos limit 10
   housemanfs ext [n]        occupied space by extension
   housemanfs explain <path> the measurement behind one indexed path
   housemanfs export         the index as versioned JSON (see --out)
@@ -91,7 +93,7 @@ fn main() -> ExitCode {
     // scan or query nothing while reporting success.
     if matches!(
         command.as_str(),
-        "info" | "scan" | "index" | "find" | "explain"
+        "info" | "scan" | "index" | "find" | "explain" | "ask"
     ) && path.is_empty()
     {
         eprintln!("error: `{command}` needs an argument");
@@ -121,6 +123,7 @@ fn main() -> ExitCode {
         "top" => index::top(&db, limit, &mut out),
         "dirs" => index::dirs(&db, limit, &mut out),
         "find" => index::search(&db, &path, limit, &mut out),
+        "ask" => index::ask(&db, &path, &mut out),
         "ext" => index::extensions(&db, limit, &mut out),
         "explain" => index::explain(&db, &path, &mut out),
         "export" => index::export(&db, limit, &mut out),

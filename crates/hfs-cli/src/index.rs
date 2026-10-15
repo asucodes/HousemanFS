@@ -659,12 +659,200 @@ fn windows_ticks_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Split `>=500MB` into its operator and amount.
+fn split_comparison(rest: &str) -> Option<(&str, &str)> {
+    for op in [">=", "<=", ">", "<"] {
+        if let Some(amount) = rest.strip_prefix(op) {
+            if !amount.is_empty() {
+                return Some((op, amount));
+            }
+        }
+    }
+    None
+}
+
+/// Parse `500MB` into bytes. Units are binary (MB = 1024²), matching how the tool reports
+/// sizes everywhere else; a bare number means bytes.
+fn parse_size(amount: &str) -> Option<u64> {
+    let lower = amount.to_ascii_lowercase();
+    let (digits, factor) = if let Some(n) = lower.strip_suffix("tb") {
+        (n, 1u64 << 40)
+    } else if let Some(n) = lower.strip_suffix("gb") {
+        (n, 1u64 << 30)
+    } else if let Some(n) = lower.strip_suffix("mb") {
+        (n, 1u64 << 20)
+    } else if let Some(n) = lower.strip_suffix("kb") {
+        (n, 1u64 << 10)
+    } else if let Some(n) = lower.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    digits.parse::<u64>().ok()?.checked_mul(factor)
+}
+
+/// Parse `30d` into Windows ticks. Months are 30 days and years 365: approximate, and the
+/// approximation is stated rather than hidden behind calendar arithmetic nobody asked for.
+fn parse_age(amount: &str) -> Option<i64> {
+    const TICK: i64 = 10_000_000;
+    const DAY: i64 = 86_400 * TICK;
+    let lower = amount.to_ascii_lowercase();
+    // Leading digits, trailing unit. A missing unit is not an age — `30` alone could be
+    // days, seconds or nothing, and guessing would answer a different question.
+    let split = lower.find(|c: char| !c.is_ascii_digit())?;
+    let (digits, unit) = lower.split_at(split);
+    let days_per: i64 = match unit {
+        "d" | "day" | "days" => 1,
+        "w" | "week" | "weeks" => 7,
+        "m" | "month" | "months" => 30,
+        "y" | "year" | "years" => 365,
+        _ => return None,
+    };
+    digits
+        .parse::<i64>()
+        .ok()?
+        .checked_mul(days_per)?
+        .checked_mul(DAY)
+}
+
+/// Kind words with fixed, documented meanings. A closed list, shown in full in the usage
+/// text: adding a kind changes what questions can be asked, so it happens here in the
+/// open, not inside a model where nobody can see it.
+fn kind_alias(word: &str) -> Option<&'static [&'static str]> {
+    match word {
+        "video" | "videos" => Some(&["mp4", "mkv", "avi", "mov", "wmv", "webm"]),
+        "audio" | "music" => Some(&["mp3", "flac", "wav", "ogg", "m4a"]),
+        "image" | "images" | "photo" | "photos" => {
+            Some(&["jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp", "raw"])
+        }
+        "archive" | "archives" => Some(&["zip", "7z", "rar", "tar", "gz"]),
+        "installer" | "installers" => Some(&["exe", "msi"]),
+        "disk" | "disks" | "iso" | "isos" | "image-file" => Some(&["iso", "img", "vhd", "vhdx"]),
+        _ => None,
+    }
+}
+
 /// Pick the singular or plural form. A report that says "1 streams" is a small
 /// carelessness, and carelessness compounds in a tool that asks to be trusted.
 pub(crate) fn plural(count: u64, singular: &'static str, plural: &'static str) -> &'static str {
     if count == 1 { singular } else { plural }
 }
 
+/// Answer a structured question over the index.
+///
+/// The query language is small and deterministic: size, extension, name, age, sharing and
+/// streams, in any order. It is pattern matching, not understanding — `ask "old isos"`
+/// works because `old` and `isos` are known words, not because anything comprehended the
+/// sentence. A future language-model frontend would compile into [`AskQuery`], which bounds
+/// what it can express; until then, this parser is the whole of "ask".
+pub fn ask(db: &str, raw: &str, out: &mut String) -> Result<(), String> {
+    let query = parse_ask(raw)?;
+    let index = open(db)?;
+    let rows = index.ask(&query).map_err(|e| e.to_string())?;
+
+    let _ = writeln!(out, "asking {raw:?}");
+    let _ = writeln!(out);
+    if rows.is_empty() {
+        let _ = writeln!(out, "nothing matches");
+        return Ok(());
+    }
+    for hit in rows {
+        let _ = writeln!(
+            out,
+            "{:>12}  {:>12}  {}",
+            human(hit.allocated),
+            format_age(hit.modified),
+            truncate(&hit.path, 90)
+        );
+        if hit.links > 1 {
+            let _ = writeln!(out, "             {} names share this data", hit.links);
+        }
+        write_stream_note(out, hit.stream_bytes, hit.stream_count);
+    }
+    Ok(())
+}
+
+/// Compile a question into the typed query. Unknown words are an error naming what is
+/// understood, because silently dropping a clause would answer a different question than
+/// the one asked — the same policy as the LIKE escaping: never reinterpret input quietly.
+fn parse_ask(raw: &str) -> Result<hfs_index::AskQuery, String> {
+    const HELP: &str = "try: size>500MB ext:iso older than 1y shared streams name:backup limit 10";
+    let mut query = hfs_index::AskQuery {
+        limit: 20,
+        ..Default::default()
+    };
+    let words: Vec<&str> = raw.split_whitespace().collect();
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i];
+        let lower = word.to_ascii_lowercase();
+        if lower == "largest" || lower == "biggest" {
+            // Accepted and ignored: results always arrive largest first.
+        } else if lower == "shared" {
+            query.shared_only = true;
+        } else if lower == "streams" {
+            query.streams_only = true;
+        } else if let Some(rest) = lower.strip_prefix("size") {
+            let (op, amount) = split_comparison(rest).ok_or_else(|| {
+                format!("don't understand {word:?}. Size looks like size>500MB. {HELP}")
+            })?;
+            let bytes = parse_size(amount).ok_or_else(|| {
+                format!("don't understand {amount:?}. Sizes look like 500MB or 2GB. {HELP}")
+            })?;
+            match op {
+                ">" | ">=" => query.min_allocated = Some(bytes),
+                "<" | "<=" => query.max_allocated = Some(bytes),
+                _ => return Err(format!("don't understand {word:?}. {HELP}")),
+            }
+        } else if let Some(rest) = lower.strip_prefix("ext:") {
+            for ext in rest.split(',') {
+                let clean = ext.trim().trim_start_matches('.').to_string();
+                if clean.is_empty() {
+                    return Err(format!("don't understand {word:?}. {HELP}"));
+                }
+                query.exts.push(clean);
+            }
+        } else if let Some(rest) = word.strip_prefix("name:") {
+            if rest.is_empty() {
+                return Err(format!("don't understand {word:?}. {HELP}"));
+            }
+            query.name = Some(rest.to_string());
+        } else if lower == "older" || lower == "newer" {
+            let direction = lower.as_str();
+            let than = words.get(i + 1).copied().unwrap_or("");
+            let amount = words.get(i + 2).copied().unwrap_or("");
+            if than != "than" || amount.is_empty() {
+                return Err(format!(
+                    "don't understand {word:?}. Age looks like `older than 30d`. {HELP}"
+                ));
+            }
+            let ticks = parse_age(amount).ok_or_else(|| {
+                format!("don't understand {amount:?}. Ages look like 30d, 6m or 2y. {HELP}")
+            })?;
+            let cutoff = windows_ticks_now() - ticks;
+            if direction == "older" {
+                query.older_than = Some(cutoff);
+            } else {
+                query.newer_than = Some(cutoff);
+            }
+            i += 2;
+        } else if lower == "limit" {
+            let amount = words.get(i + 1).copied().unwrap_or("");
+            query.limit = amount
+                .parse()
+                .map_err(|_| format!("don't understand {amount:?} as a limit. {HELP}"))?;
+            i += 1;
+        } else if let Some(exts) = kind_alias(&lower) {
+            query.exts.extend(exts.iter().map(|s| s.to_string()));
+        } else if i == words.len() - 1 && lower.parse::<u32>().is_ok() {
+            query.limit = lower.parse().unwrap_or(20);
+        } else {
+            return Err(format!("don't understand {word:?}. {HELP}"));
+        }
+        i += 1;
+    }
+    Ok(query)
+}
 /// Totals by extension.
 pub fn extensions(db: &str, limit: u32, out: &mut String) -> Result<(), String> {
     let index = open(db)?;
@@ -778,5 +966,37 @@ mod tests {
         let second = windows_ticks_now();
         assert!(second >= first);
         assert!(second % 10_000_000 != 0 || first % 10_000_000 != 0);
+    }
+
+    #[test]
+    fn ask_parses_every_clause() {
+        let query = parse_ask(
+            "largest videos size>500MB ext:iso older than 30d shared streams name:backup limit 5",
+        )
+        .unwrap();
+        assert_eq!(query.min_allocated, Some(500 * (1u64 << 20)));
+        assert!(query.exts.contains(&"iso".to_string()));
+        // The kind word contributes its extensions alongside the explicit one.
+        assert!(query.exts.contains(&"mp4".to_string()));
+        assert!(query.older_than.is_some());
+        assert!(query.shared_only);
+        assert!(query.streams_only);
+        assert_eq!(query.name.as_deref(), Some("backup"));
+        assert_eq!(query.limit, 5);
+    }
+
+    #[test]
+    fn ask_rejects_what_it_cannot_answer() {
+        assert!(parse_ask("color:red").is_err());
+        assert!(parse_ask("size>big").is_err());
+        assert!(parse_ask("older than").is_err());
+        assert!(parse_ask("older next 30d").is_err());
+    }
+
+    #[test]
+    fn ask_sizes_are_binary() {
+        let query = parse_ask("size>=2GB size<1TB").unwrap();
+        assert_eq!(query.min_allocated, Some(2 * (1u64 << 30)));
+        assert_eq!(query.max_allocated, Some(1u64 << 40));
     }
 }
