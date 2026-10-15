@@ -60,6 +60,9 @@ enum Message {
     Done(Result<DupReport, String>),
 }
 
+/// What one poll reports: the latest progress, and the report exactly once.
+type Poll = (Option<(u64, u64)>, Option<Result<DupReport, String>>);
+
 /// A running duplicate search. Poll it; do not block on it.
 pub struct DupWorker {
     rx: Receiver<Message>,
@@ -90,7 +93,7 @@ impl DupWorker {
     }
 
     /// Drain progress: latest (members read, bytes read), and the report exactly once.
-    pub fn poll(&mut self) -> (Option<(u64, u64)>, Option<Result<DupReport, String>>) {
+    pub fn poll(&mut self) -> Poll {
         let mut progress = None;
         let mut done = None;
         while let Ok(message) = self.rx.try_recv() {
@@ -247,7 +250,9 @@ fn partition_identical(
     }
     let mut sets: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
     for (index, _) in paths.iter().enumerate() {
-        sets.entry(find(&mut parent, index)).or_default().push(index);
+        sets.entry(find(&mut parent, index))
+            .or_default()
+            .push(index);
     }
     sets.into_values().collect()
 }
@@ -284,10 +289,7 @@ fn resolve_groups(
             // are equal files and no second pass exists to run.
             if group.logical <= PREFIX_BYTES {
                 confirmed.push(finish(
-                    indexes
-                        .iter()
-                        .map(|&index| &group.members[index])
-                        .collect(),
+                    indexes.iter().map(|&index| &group.members[index]).collect(),
                 ));
                 continue;
             }
@@ -301,7 +303,9 @@ fn resolve_groups(
                     continue;
                 }
                 confirmed.push(finish(
-                    set.into_iter().map(|n| &group.members[indexes[n]]).collect(),
+                    set.into_iter()
+                        .map(|n| &group.members[indexes[n]])
+                        .collect(),
                 ));
             }
         }
@@ -350,7 +354,11 @@ mod tests {
 
     #[test]
     fn equal_prefixes_confirm_small_files() {
-        let groups = vec![small_group(vec![member("a", 1), member("b", 2), member("c", 3)])];
+        let groups = vec![small_group(vec![
+            member("a", 1),
+            member("b", 2),
+            member("c", 3),
+        ])];
         let mut dropped = 0;
         let confirmed = resolve_groups(
             &groups,
@@ -367,7 +375,11 @@ mod tests {
 
     #[test]
     fn differing_prefixes_split_and_unreadable_members_drop_out() {
-        let groups = vec![small_group(vec![member("a", 1), member("b", 2), member("c", 3)])];
+        let groups = vec![small_group(vec![
+            member("a", 1),
+            member("b", 2),
+            member("c", 3),
+        ])];
         let mut dropped = 0;
         let confirmed = resolve_groups(
             &groups,

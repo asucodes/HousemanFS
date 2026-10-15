@@ -93,7 +93,8 @@ model on a wrong index produces confident wrong answers faster, which is worse t
 - A minimal interface. Read-only, and visibly so. **Done twice:** the finder renders the
   index in a terminal and cannot initiate an action, and the desktop client
   (`housemanfs-desktop`) offers folder picking, background scanning with progress and
-  cancel, a residual dashboard, tables, an allocated-size treemap, structured search,
+  cancel, a residual dashboard, sortable tables, an allocated-size treemap with
+  drill-down, structured search, byte-proven duplicate detection, a what-changed view,
   evidence panels and gated suggestions — rendering the same index through the same
   shared conversions, deciding nothing.
 

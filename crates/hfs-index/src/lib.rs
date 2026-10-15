@@ -10,17 +10,18 @@
 //!
 //! No platform code lives here, so the index is testable anywhere.
 
+use std::collections::HashMap;
+
 use hfs_core::FileProvenance;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 /// Schema version. Bump only with a migration, never in place.
 ///
-/// Version 3 adds the last-write timestamp that refreshes compare for change detection.
-/// Version 2 added per-entry stream occupancy and provenance. Version 1 indexes migrate
-/// forward through each step on open; anything else is rejected with instructions to
-/// rebuild, because the index is derived data and a rebuild is always safe.
-pub const SCHEMA_VERSION: u32 = 3;
+/// Version 4 adds the change log a refresh writes: what the last scan added, removed,
+/// modified and moved. Version 3 added last-write timestamps; version 2 added streams
+/// and provenance. Older indexes migrate forward through each step on open.
+pub const SCHEMA_VERSION: u32 = 4;
 
 const SCHEMA: &str = r#"
 CREATE TABLE meta (
@@ -77,9 +78,34 @@ CREATE INDEX files_parent    ON files(parent);
 CREATE INDEX files_id        ON files(id);
 CREATE INDEX dirs_subtree    ON dirs(subtree_allocated DESC);
 CREATE INDEX dirs_path       ON dirs(path);
+
+-- What the last refresh changed, newest first. Capped and rewritten per refresh: the
+-- question is "what moved since I last looked", not a full history. Paths, not rows —
+-- re-query the entry for its current figures.
+CREATE TABLE changes (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    at   INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    path TEXT NOT NULL
+);
+CREATE INDEX changes_order ON changes(id DESC);
 "#;
 
-/// Bring a version-2 index forward: the last-write timestamp that refreshes compare.
+/// Bring a version-3 index forward: the change log the next refresh will write.
+///
+/// Older rows have no recorded past, so the table starts empty: "no recorded changes" is
+/// honest, while inventing a first refresh from a migration would not be.
+fn migrate_v3_to_v4(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE changes (
+             id   INTEGER PRIMARY KEY AUTOINCREMENT,
+             at   INTEGER NOT NULL,
+             kind TEXT NOT NULL,
+             path TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS changes_order ON changes(id DESC);",
+    )
+}
 ///
 /// Backfilled to 0, which is 1601-01-01 in Windows ticks and therefore never a real
 /// modification time — an unambiguous "unknown". A refresh treats unknown stored
@@ -201,9 +227,37 @@ pub struct FileHit {
     pub modified: i64,
 }
 
+/// One recorded change: what happened to which path, and when (Windows ticks).
+#[derive(Debug, Clone)]
+pub struct ChangeEntry {
+    pub at: i64,
+    pub kind: String,
+    pub path: String,
+}
+
+/// How many change paths one refresh records. Counts stay exact past the cap; the paths
+/// do not, and the report says so. A renamed top-level folder could otherwise log
+/// millions of rows to answer a question nobody asked at that resolution.
+const CHANGE_LOG_LIMIT: usize = 500;
+
+/// Record one change path, marking truncation instead of silently dropping.
+fn note_change(
+    log: &mut Vec<(&str, String)>,
+    truncated: &mut bool,
+    kind: &'static str,
+    path: String,
+) {
+    if log.len() < CHANGE_LOG_LIMIT {
+        log.push((kind, path));
+    } else {
+        *truncated = true;
+    }
+}
+
 /// A directory subtree together with enough to display.
 #[derive(Debug, Clone)]
 pub struct DirHit {
+    pub id: [u8; 16],
     pub path: String,
     pub allocated: u64,
     pub streams: u64,
@@ -307,6 +361,9 @@ pub struct RefreshReport {
     pub modified_files: u64,
     pub moved_files: u64,
     pub stale_files: u64,
+    /// True when more paths changed than the change log holds. Counts above stay exact;
+    /// the stored paths do not cover everything.
+    pub changes_truncated: bool,
 }
 
 /// One entry's measurements and where they came from: the unit `explain` reports.
@@ -365,10 +422,15 @@ impl Index {
         match existing {
             None => conn.execute_batch(SCHEMA)?,
             Some(v) if v == SCHEMA_VERSION => {}
-            Some(2) => migrate_v2_to_v3(&conn)?,
+            Some(3) => migrate_v3_to_v4(&conn)?,
+            Some(2) => {
+                migrate_v2_to_v3(&conn)?;
+                migrate_v3_to_v4(&conn)?;
+            }
             Some(1) => {
                 migrate_v1_to_v2(&conn)?;
                 migrate_v2_to_v3(&conn)?;
+                migrate_v3_to_v4(&conn)?;
             }
             Some(v) => {
                 return Err(rusqlite::Error::SqliteFailure(
@@ -519,15 +581,21 @@ impl Index {
     /// their parent) are left untouched and counted as stale, because deleting an entry
     /// that still exists would be worse than keeping one that does not. The report says
     /// which happened.
+    ///
+    /// Every applied change is also written to the change log (capped — counts stay exact
+    /// when the log truncates, and the report says so), stamped with `at`, so a later
+    /// reader can answer "what moved since I last looked" without re-walking.
     pub fn refresh_scan<'a>(
         &mut self,
         meta: &ScanMetadata,
         dirs: impl Iterator<Item = &'a DirRow>,
         files: impl Iterator<Item = &'a FileRow>,
+        at: i64,
     ) -> rusqlite::Result<RefreshReport> {
         use std::collections::{HashMap, HashSet};
 
         let mut report = RefreshReport::default();
+        // (kind, path), in apply order: added and removed directories first, then files.
 
         // A stored directory: parent id, path, and the measured fields a refresh compares.
         type StoredDir = (Option<Vec<u8>>, String, i64, i64, u32, String);
@@ -590,6 +658,15 @@ impl Index {
 
         let tx = self.conn.transaction()?;
 
+        // New directories indexed by identity, so file paths resolve while diffing.
+        // Collected up front because the diff consumes the iterator exactly once.
+        let dirs: Vec<&'a DirRow> = dirs.collect();
+        let mut new_paths: HashMap<Vec<u8>, &str> = HashMap::new();
+        for dir in &dirs {
+            new_paths.insert(dir.id.to_vec(), dir.path.as_str());
+        }
+        let mut change_log: Vec<(&str, String)> = Vec::new();
+
         // Directories first, so file parentage always resolves against the new tree.
         let mut new_dir_ids: HashSet<Vec<u8>> = HashSet::new();
         let mut new_dir_paths: HashSet<&str> = HashSet::new();
@@ -612,7 +689,7 @@ impl Index {
                 tx.prepare("UPDATE files SET parent = ?2 WHERE parent = ?1")?;
             let mut delete = tx.prepare("DELETE FROM dirs WHERE id = ?1")?;
 
-            for dir in dirs {
+            for dir in &dirs {
                 let id = dir.id.to_vec();
                 new_dir_ids.insert(id.clone());
                 new_dir_paths.insert(dir.path.as_str());
@@ -665,6 +742,12 @@ impl Index {
                         dir.provenance.as_str(),
                     ])?;
                     report.added_dirs += 1;
+                    note_change(
+                        &mut change_log,
+                        &mut report.changes_truncated,
+                        "added-dir",
+                        dir.path.clone(),
+                    );
                 }
             }
 
@@ -685,6 +768,12 @@ impl Index {
                 if parent_scanned {
                     delete.execute(params![id])?;
                     report.removed_dirs += 1;
+                    note_change(
+                        &mut change_log,
+                        &mut report.changes_truncated,
+                        "removed-dir",
+                        path.clone(),
+                    );
                 } else {
                     report.stale_dirs += 1;
                 }
@@ -735,11 +824,18 @@ impl Index {
                 match old_files.remove(&key) {
                     Some(old) if old == fresh => {}
                     Some(_) => {
+                        let full = full_path(&new_paths, &key.0, &key.1);
                         update.execute(params![
                             key.0, key.1, fresh.0, fresh.1, fresh.2, fresh.3, fresh.4, fresh.5,
                             fresh.6, fresh.7
                         ])?;
                         report.modified_files += 1;
+                        note_change(
+                            &mut change_log,
+                            &mut report.changes_truncated,
+                            "modified",
+                            full,
+                        );
                     }
                     None => {
                         // Not at this location. Same identity elsewhere means moved or
@@ -752,18 +848,32 @@ impl Index {
                             .filter(|old_key| old_files.remove(old_key).is_some());
                         match relocated {
                             Some((old_parent, old_name)) => {
+                                let full = full_path(&new_paths, &key.0, &key.1);
                                 relocate.execute(params![
                                     old_parent, old_name, key.0, key.1, fresh.1, fresh.2, fresh.3,
                                     fresh.4, fresh.5, fresh.6, fresh.7
                                 ])?;
                                 report.moved_files += 1;
+                                note_change(
+                                    &mut change_log,
+                                    &mut report.changes_truncated,
+                                    "moved",
+                                    full,
+                                );
                             }
                             None => {
+                                let full = full_path(&new_paths, &key.0, &key.1);
                                 insert.execute(params![
                                     fresh.0, key.0, key.1, file.ext, fresh.1, fresh.2, fresh.3,
                                     fresh.4, fresh.5, fresh.6, fresh.7
                                 ])?;
                                 report.added_files += 1;
+                                note_change(
+                                    &mut change_log,
+                                    &mut report.changes_truncated,
+                                    "added",
+                                    full,
+                                );
                             }
                         }
                     }
@@ -776,11 +886,31 @@ impl Index {
             // but never entered, so absence proves nothing.
             for ((parent, name), _) in old_files {
                 if new_dir_ids.contains(&parent) && !new_denied_ids.contains(&parent) {
+                    let full = match old_dirs.get(&parent) {
+                        Some((_, dir, ..)) => join_path(dir, &name),
+                        None => name.clone(),
+                    };
                     delete.execute(params![parent, name])?;
                     report.removed_files += 1;
+                    note_change(
+                        &mut change_log,
+                        &mut report.changes_truncated,
+                        "removed",
+                        full,
+                    );
                 } else {
                     report.stale_files += 1;
                 }
+            }
+        }
+
+        // The change log replaces whatever the last refresh recorded: the question is what
+        // moved since the previous look, not a full history.
+        tx.execute_batch("DELETE FROM changes;")?;
+        {
+            let mut log = tx.prepare("INSERT INTO changes (at, kind, path) VALUES (?1, ?2, ?3)")?;
+            for (kind, path) in &change_log {
+                log.execute(params![at, kind, path])?;
             }
         }
 
@@ -788,6 +918,23 @@ impl Index {
         tx.commit()?;
         self.propagate_subtree_totals()?;
         Ok(report)
+    }
+
+    /// What the last refresh changed, newest first: the answer to "what moved since I
+    /// last looked". Paths, not rows — re-query an entry for its current figures, because
+    /// the file may have moved again since the log was written.
+    pub fn recent_changes(&self, limit: u32) -> rusqlite::Result<Vec<ChangeEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT at, kind, path FROM changes ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(ChangeEntry {
+                at: row.get::<_, i64>(0)?,
+                kind: row.get::<_, String>(1)?,
+                path: row.get::<_, String>(2)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Roll each directory's own contents up through its ancestors.
@@ -1062,17 +1209,33 @@ impl Index {
     /// The largest directory subtrees by occupied size, streams included.
     pub fn largest_dirs(&self, limit: u32) -> rusqlite::Result<Vec<DirHit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, subtree_allocated, subtree_stream, subtree_files
+            "SELECT id, path, subtree_allocated, subtree_stream, subtree_files
              FROM dirs ORDER BY subtree_allocated DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit], |row| {
-            Ok(DirHit {
-                path: row.get::<_, String>(0)?,
-                allocated: row.get::<_, i64>(1)? as u64,
-                streams: row.get::<_, i64>(2)? as u64,
-                files: row.get::<_, i64>(3)? as u64,
-            })
-        })?;
+        let rows = stmt.query_map(params![limit], dir_hit)?;
+        rows.collect()
+    }
+
+    /// The immediate subdirectories of one directory, largest first: treemap drill-down.
+    ///
+    /// Subtree figures already include everything beneath each child, so descending never
+    /// re-sums — the map shows slices of one consistent roll-up, not fresh estimates.
+    pub fn dirs_under(&self, parent: &[u8], limit: u32) -> rusqlite::Result<Vec<DirHit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, subtree_allocated, subtree_stream, subtree_files
+             FROM dirs WHERE parent = ?1 ORDER BY subtree_allocated DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![parent.to_vec(), limit], dir_hit)?;
+        rows.collect()
+    }
+
+    /// The largest files directly inside one directory: the file tiles beside the
+    /// subdirectory tiles when the map descends.
+    pub fn files_under(&self, parent: &[u8], limit: u32) -> rusqlite::Result<Vec<FileHit>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{FILE_COLUMNS} WHERE f.parent = ?1 ORDER BY f.allocated DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![parent.to_vec(), limit], file_hit)?;
         rows.collect()
     }
 
@@ -1201,7 +1364,9 @@ impl Index {
                 id: row.get::<_, Vec<u8>>(4)?,
                 links: row.get::<_, u32>(5)?,
             };
-            let same_group = current.as_ref().is_some_and(|group| group.logical == logical);
+            let same_group = current
+                .as_ref()
+                .is_some_and(|group| group.logical == logical);
             if !same_group {
                 if let Some(group) = current.take() {
                     // A lone dataset is not a group: one hardlink family, however many
@@ -1317,6 +1482,18 @@ impl Index {
     }
 }
 
+/// Join a parent identity and a name into the full path the new tree spells.
+///
+/// Falls back to the bare name when the parent has no row — which should not happen, but
+/// a change log must never fail a refresh, so the fallback is a degraded path rather
+/// than an error.
+fn full_path(parents: &HashMap<Vec<u8>, &str>, parent: &[u8], name: &str) -> String {
+    match parents.get(parent) {
+        Some(dir) => join_path(dir, name),
+        None => name.to_string(),
+    }
+}
+
 /// Join a directory path and a name without doubling the separator.
 ///
 /// A volume root is stored as `C:\`, which already ends in a separator, so a naive join
@@ -1352,6 +1529,24 @@ fn file_hit(row: &rusqlite::Row) -> rusqlite::Result<FileHit> {
         stream_count: row.get::<_, u32>(6)?,
         provenance: FileProvenance::parse(&row.get::<_, String>(7)?),
         modified: row.get::<_, i64>(8)?,
+    })
+}
+
+/// One directory row from a subtree query. Identity is 16 bytes or the row is corrupt —
+/// failing beats misattributing a subtree to the wrong directory.
+fn dir_hit(row: &rusqlite::Row) -> rusqlite::Result<DirHit> {
+    Ok(DirHit {
+        id: row.get::<_, Vec<u8>>(0)?.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Blob,
+                "directory id is not 16 bytes".into(),
+            )
+        })?,
+        path: row.get::<_, String>(1)?,
+        allocated: row.get::<_, i64>(2)? as u64,
+        streams: row.get::<_, i64>(3)? as u64,
+        files: row.get::<_, i64>(4)? as u64,
     })
 }
 
@@ -1654,6 +1849,51 @@ mod tests {
     }
 
     #[test]
+    fn drill_down_lists_children_not_estimates() {
+        let mut index = empty();
+
+        let root = [1u8; 16];
+        let child = [2u8; 16];
+        let dirs = [
+            root_dir(),
+            DirRow {
+                id: child,
+                parent: Some(root),
+                name: "data".to_string(),
+                path: r"C:\data".to_string(),
+                depth: 1,
+                index_bytes: 0,
+                stream_bytes: 0,
+                stream_count: 0,
+                provenance: FileProvenance::Full,
+            },
+        ];
+        let files = [
+            file_row([3u8; 16], child, "file.bin", 4_096, 0),
+            file_row([4u8; 16], root, "top.bin", 8_192, 0),
+        ];
+        index
+            .write_scan(&meta(), dirs.iter(), files.iter())
+            .unwrap();
+
+        // Descending shows the child's own contents: its subdirectory rows and its files,
+        // both from the same roll-up the parent totals came from.
+        let under = index.dirs_under(&root, 10).unwrap();
+        assert_eq!(under.len(), 1);
+        assert_eq!(under[0].path, r"C:\data");
+        assert_eq!(under[0].allocated, 4_096);
+        let hits = index.files_under(&child, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("file.bin"));
+        assert!(
+            index.files_under(&root, 10).unwrap()[0]
+                .path
+                .ends_with("top.bin")
+        );
+        assert!(index.dirs_under(&child, 10).unwrap().is_empty());
+    }
+
+    #[test]
     fn a_version_1_index_migrates_forward_without_losing_rows() {
         // A v1 database, built the way the old schema did: no stream or provenance
         // columns, version stamped 1. Committed here as SQL rather than as a binary,
@@ -1697,7 +1937,7 @@ CREATE TABLE files (
         }
 
         let index = Index::open(&path).expect("a v1 index migrates on open");
-        assert_eq!(index.meta("schema_version").as_deref(), Some("3"));
+        assert_eq!(index.meta("schema_version").as_deref(), Some("4"));
 
         // The rows survived, and their unknown past is reported as unknown.
         let largest = index.largest_files(1).unwrap();
@@ -1844,7 +2084,11 @@ CREATE TABLE files (
         let groups = index.size_groups(0, 10, 10).unwrap();
         assert_eq!(groups.len(), 1, "only the shared size groups");
         assert_eq!(groups[0].logical, 100_000);
-        assert_eq!(groups[0].members.len(), 2, "the hardlink family is one member");
+        assert_eq!(
+            groups[0].members.len(),
+            2,
+            "the hardlink family is one member"
+        );
         assert_eq!(groups[0].distinct_ids(), 2);
 
         // The floor excludes everything.
@@ -1920,7 +2164,7 @@ CREATE TABLE files (
             file_row([3u8; 16], root, "growing.txt", 8_192, 200),
         ];
         let report = index
-            .refresh_scan(&meta(), std::iter::once(&dir), after.iter())
+            .refresh_scan(&meta(), std::iter::once(&dir), after.iter(), 1_000)
             .unwrap();
 
         assert_eq!(report.added_files, 0);
@@ -1965,7 +2209,7 @@ CREATE TABLE files (
             file_row([5u8; 16], root, "newcomer.txt", 4_096, 300),
         ];
         let report = index
-            .refresh_scan(&meta(), dirs.iter(), after.iter())
+            .refresh_scan(&meta(), dirs.iter(), after.iter(), 1_000)
             .unwrap();
 
         assert_eq!(report.added_files, 1);
@@ -1975,6 +2219,17 @@ CREATE TABLE files (
         assert!(index.search_name("doomed", 5).unwrap().is_empty());
         let moved = index.search_name("traveller", 1).unwrap();
         assert_eq!(moved[0].path, r"C:\data\traveller.txt");
+
+        // The change log names what the counts count.
+        let changes = index.recent_changes(10).unwrap();
+        let kinds: Vec<(&str, &str)> = changes
+            .iter()
+            .map(|change| (change.kind.as_str(), change.path.as_str()))
+            .collect();
+        assert!(kinds.contains(&("added", r"C:\newcomer.txt")));
+        assert!(kinds.contains(&("removed", r"C:\doomed.txt")));
+        assert!(kinds.contains(&("moved", r"C:\data\traveller.txt")));
+        assert!(changes.iter().all(|change| change.at == 1_000));
     }
 
     #[test]
@@ -2010,6 +2265,7 @@ CREATE TABLE files (
                 &meta(),
                 [root_dir(), denied_vault].iter(),
                 std::iter::empty(),
+                1_000,
             )
             .unwrap();
 

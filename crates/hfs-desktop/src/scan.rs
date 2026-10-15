@@ -148,7 +148,12 @@ fn scan(
     } else {
         Some(
             index
-                .refresh_scan(&scan.meta, scan.dirs.iter(), scan.files.iter())
+                .refresh_scan(
+                    &scan.meta,
+                    scan.dirs.iter(),
+                    scan.files.iter(),
+                    hfs_core::format::windows_ticks_now(),
+                )
                 .map_err(|e| e.to_string())?,
         )
     };

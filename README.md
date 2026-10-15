@@ -77,6 +77,14 @@ housemanfs          the terminal: scan, index, ask, explain, suggest, export
 housemanfs-desktop  the window: folder pick, background scan, dashboard, treemap
 ```
 
+The desktop client (`housemanfs-desktop`) offers folder picking, background scanning
+with progress and cancel, a residual dashboard, sortable file/dir/extension tables, an
+allocated-size treemap with drill-down, structured search, byte-proven duplicate
+detection (same size is suspicion, same bytes are the verdict — hardlink families
+flagged per copy, never counted as duplicates), a what-changed view fed by every
+refresh, per-figure evidence panels, and gated suggestions. It renders; it decides
+nothing: the only process it can spawn is an Explorer window showing a file.
+
 Run the desktop client with `cargo run -p hfs-desktop --release`, or launch
 `target/release/housemanfs-desktop.exe` directly. It needs no installation and no
 network: one binary, local only, like everything else here.

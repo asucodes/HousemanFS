@@ -1,4 +1,5 @@
 pub mod browse;
+pub mod changes;
 pub mod dashboard;
 pub mod duplicates;
 pub mod home;

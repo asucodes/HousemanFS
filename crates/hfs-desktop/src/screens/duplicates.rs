@@ -12,8 +12,8 @@
 use hfs_core::format::human_bytes;
 
 use super::browse::row;
-use crate::dupes::DupWorker;
 use crate::App;
+use crate::dupes::DupWorker;
 
 const PRESETS: &[(&str, u64)] = &[
     ("any size", 0),
@@ -83,10 +83,11 @@ impl App {
         };
 
         ui.small(format!(
-            "{} size groups checked, {} confirmed, {} unreadable skipped",
+            "{} size groups checked, {} confirmed, {} unreadable skipped, {} read",
             report.groups_checked,
             report.groups.len(),
-            report.skipped
+            report.skipped,
+            human_bytes(report.bytes_read)
         ));
         if report.groups.is_empty() {
             ui.label("No confirmed duplicates. Same sizes, different bytes — or everything shares storage already.");
@@ -104,11 +105,8 @@ impl App {
                 .default_open(false)
                 .show(ui, |ui| {
                     for member in &group.members {
-                        let mut line = format!(
-                            "{:>12}  {}",
-                            human_bytes(member.allocated),
-                            member.path
-                        );
+                        let mut line =
+                            format!("{:>12}  {}", human_bytes(member.allocated), member.path);
                         if member.links > 1 {
                             line.push_str(&format!(
                                 "  [{} names share this copy — deleting one frees nothing]",

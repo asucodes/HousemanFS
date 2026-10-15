@@ -54,17 +54,19 @@ enum Screen {
     Map,
     Search,
     Duplicates,
+    Changes,
     Suggest,
 }
 
 impl Screen {
-    const ALL: [(Screen, &'static str); 7] = [
+    const ALL: [(Screen, &'static str); 8] = [
         (Screen::Home, "Scan"),
         (Screen::Dashboard, "Dashboard"),
         (Screen::Browse, "Browse"),
         (Screen::Map, "Map"),
         (Screen::Search, "Search"),
         (Screen::Duplicates, "Duplicates"),
+        (Screen::Changes, "Changes"),
         (Screen::Suggest, "Suggest"),
     ];
 }
@@ -126,6 +128,10 @@ struct App {
     dup_report: Option<dupes::DupReport>,
     dup_error: Option<String>,
     dup_min: usize,
+    changes: Vec<hfs_index::ChangeEntry>,
+    map_stack: Vec<([u8; 16], String)>,
+    file_sort: (u8, bool),
+    dir_sort: (u8, bool),
 }
 
 impl App {
@@ -180,6 +186,10 @@ impl App {
             dup_report: None,
             dup_error: None,
             dup_min: 2,
+            changes: Vec::new(),
+            map_stack: Vec::new(),
+            file_sort: (0, false),
+            dir_sort: (0, false),
         }
     }
 
@@ -225,6 +235,8 @@ impl App {
         self.find_rows.clear();
         self.ask_rows.clear();
         self.suggest_ran = false;
+        self.map_stack.clear();
+        self.load_changes();
         Ok(())
     }
 
@@ -310,6 +322,7 @@ impl eframe::App for App {
             Screen::Map => self.show_map(ui),
             Screen::Search => self.show_search(ui),
             Screen::Duplicates => self.show_duplicates(ui),
+            Screen::Changes => self.show_changes(ui),
             Screen::Suggest => self.show_suggest(ui),
         });
 

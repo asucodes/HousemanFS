@@ -56,7 +56,12 @@ pub fn refresh(db: &str, path: &str, out: &mut String) -> Result<(), String> {
 
     let scan = collect(&root, out)?;
     let report = index
-        .refresh_scan(&scan.meta, scan.dirs.iter(), scan.files.iter())
+        .refresh_scan(
+            &scan.meta,
+            scan.dirs.iter(),
+            scan.files.iter(),
+            windows_ticks_now(),
+        )
         .map_err(|e| e.to_string())?;
 
     print_refresh(out, &report);
