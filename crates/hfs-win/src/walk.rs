@@ -24,10 +24,10 @@ use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_STREAM_INFO,
-    FileIdInfo, FileStandardInfo, FileStreamInfo, FindClose, FindExInfoBasic,
+    FileBasicInfo, FileIdInfo, FileStandardInfo, FileStreamInfo, FindClose, FindExInfoBasic,
     FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, GetFileInformationByHandleEx,
     OPEN_EXISTING, WIN32_FIND_DATAW,
 };
@@ -86,6 +86,13 @@ pub struct ScannedEntry {
     /// totals; this flag lets downstream consumers (the index, `explain`) say so per entry
     /// instead of only in aggregate.
     pub denied: bool,
+    /// Last write time in Windows ticks (100ns since 1601-01-01), when the query succeeded.
+    ///
+    /// Recorded for change detection: a refresh compares this against the stored value to
+    /// tell a modified file from an untouched one without re-measuring anything. `None`
+    /// means unknown, which a refresh treats as changed — re-reading is safe, assuming
+    /// change is not.
+    pub modified: Option<i64>,
 }
 
 /// Totals gathered during a walk.
@@ -193,6 +200,8 @@ pub struct PathFacts {
     pub id: Option<[u8; 16]>,
     /// Bytes the path itself occupies: index blocks for a directory, data for a file.
     pub allocated: u64,
+    /// Last write time in Windows ticks, when the query succeeded.
+    pub modified: Option<i64>,
 }
 
 /// Ask the filesystem for one path's identity and self-occupancy.
@@ -204,6 +213,7 @@ pub fn path_facts(path: &str) -> io::Result<PathFacts> {
     Ok(PathFacts {
         id: facts.id,
         allocated: facts.allocated,
+        modified: facts.modified,
     })
 }
 
@@ -215,15 +225,35 @@ pub fn walk_with(root: &str, options: WalkOptions) -> io::Result<Walk> {
     let root_path = PathBuf::from(root.replace('/', "\\"));
     let mut summary = WalkSummary::default();
     let mut entries = Vec::new();
+    // A directory waiting to be listed.
+    struct Pending {
+        /// The directory itself.
+        path: PathBuf,
+        /// Its own identity, when the query succeeded.
+        id: Option<[u8; 16]>,
+        /// Its parent's identity. Travels along so a directory that cannot be listed still
+        /// yields an entry: without one, a refresh could not tell "unreadable" from
+        /// "deleted", and would delete the rows beneath it.
+        parent: Option<[u8; 16]>,
+    }
     // The root's own identity becomes the parent of everything directly beneath it.
     let root_id = query_file(&root_path).ok().and_then(|f| f.id);
-    let mut pending: Vec<(PathBuf, Option<[u8; 16]>)> = vec![(root_path, root_id)];
+    let mut pending: Vec<Pending> = vec![Pending {
+        path: root_path,
+        id: root_id,
+        parent: None,
+    }];
 
     // Identity of every hardlink group already counted. Bounded by the number of hardlinked
     // files rather than by the number of files, so it stays small on typical volumes.
     let mut counted_groups: HashSet<[u8; 16]> = HashSet::new();
 
-    while let Some((dir, id)) = pending.pop() {
+    while let Some(Pending {
+        path: dir,
+        id,
+        parent,
+    }) = pending.pop()
+    {
         match read_directory(
             &dir,
             id,
@@ -232,16 +262,42 @@ pub fn walk_with(root: &str, options: WalkOptions) -> io::Result<Walk> {
             &mut entries,
             &mut counted_groups,
         ) {
-            Ok(mut children) => pending.append(&mut children),
+            Ok(children) => {
+                // Children carry their own identity and this directory's, so the next
+                // generation can place entries — and record denials — correctly.
+                pending.extend(children.into_iter().map(|(path, child)| Pending {
+                    path,
+                    id: child,
+                    parent: id,
+                }));
+            }
             // An unreadable directory is recorded and skipped. Aborting the whole scan because
             // one directory is protected would make the tool useless on a real system, and
-            // silently ignoring it would make the numbers quietly wrong.
+            // silently ignoring it would make the numbers quietly wrong. The entry marks the
+            // subtree as unscanned rather than empty: a refresh must keep the rows beneath
+            // it, because "could not look" is not "looked and found nothing".
             Err(_) => {
                 summary.denied_directories += 1;
                 if summary.denied_directory_samples.len() < DENIED_SAMPLE_LIMIT {
                     summary
                         .denied_directory_samples
                         .push(dir.display().to_string());
+                }
+                if options.collect_entries {
+                    entries.push(ScannedEntry {
+                        path: dir,
+                        kind: EntryKind::Directory,
+                        id,
+                        parent,
+                        logical: 0,
+                        allocated: 0,
+                        links: 0,
+                        stream_bytes: 0,
+                        stream_count: 0,
+                        streams_known: false,
+                        denied: true,
+                        modified: None,
+                    });
                 }
             }
         }
@@ -309,6 +365,7 @@ fn read_directory(
                         stream_count: 0,
                         streams_known: false,
                         denied: false,
+                        modified: None,
                     });
                 }
             } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
@@ -323,6 +380,7 @@ fn read_directory(
                 let queried = query_file(&path).ok();
                 let allocated = queried.as_ref().map(|f| f.allocated).unwrap_or(0);
                 let id = queried.as_ref().and_then(|f| f.id);
+                let dir_modified = queried.as_ref().and_then(|f| f.modified);
                 summary.directory_bytes += allocated;
 
                 // A directory can carry named streams too, but they cannot be enumerated
@@ -359,6 +417,7 @@ fn read_directory(
                         stream_count: dir_streams.1,
                         streams_known: dir_streams_known,
                         denied: false,
+                        modified: dir_modified,
                     });
                 }
 
@@ -400,8 +459,15 @@ fn record_file(
 ) {
     summary.files += 1;
 
-    let (allocated, links, id, streams, denied) = match query_file(path) {
-        Ok(facts) => (facts.allocated, facts.links, facts.id, facts.streams, false),
+    let (allocated, links, id, streams, denied, modified) = match query_file(path) {
+        Ok(facts) => (
+            facts.allocated,
+            facts.links,
+            facts.id,
+            facts.streams,
+            false,
+            facts.modified,
+        ),
         Err(_) => {
             // Still counted, using the size the directory entry reported, so a locked or
             // protected file does not silently vanish from the totals. Its true allocation is
@@ -410,7 +476,7 @@ fn record_file(
             // two unknowns would misstate one problem as two.
             summary.denied_files += 1;
             summary.denied_file_bytes += logical;
-            (logical, 1, None, None, true)
+            (logical, 1, None, None, true, None)
         }
     };
 
@@ -478,6 +544,7 @@ fn record_file(
             stream_count,
             streams_known,
             denied,
+            modified,
         });
     }
 }
@@ -492,6 +559,9 @@ struct FileFacts {
     /// The file's named streams, or `None` when they could not be enumerated. `None` is not
     /// zero: zero named streams is a measurement, and a failed query is the absence of one.
     streams: Option<StreamFacts>,
+    /// Last write time in Windows ticks, or `None` when it could not be read. Used for
+    /// change detection by a refresh, never as a staleness judgment on its own.
+    modified: Option<i64>,
 }
 
 /// The named streams one file carries.
@@ -531,6 +601,7 @@ fn query_file(path: &Path) -> io::Result<FileFacts> {
 
     let mut standard: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
     let mut id_info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
 
     // SAFETY: `handle` is valid and open; each buffer matches the requested information class
     // and its true size is passed.
@@ -560,6 +631,19 @@ fn query_file(path: &Path) -> io::Result<FileFacts> {
     // SAFETY: `handle` is still valid and open; the buffer is grown by the callee as needed.
     let streams = query_streams(handle);
 
+    // Timestamps ride on the same handle for free. A failure here is not fatal either: the
+    // entry is still fully measured, it simply cannot participate in change detection, and a
+    // refresh treats unknown timestamps as changed.
+    // SAFETY: `handle` is still valid and open; the buffer matches the information class.
+    let basic_ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            &mut basic as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+
     // SAFETY: `handle` is valid and is closed exactly once, on every path below.
     unsafe { CloseHandle(handle) };
 
@@ -576,6 +660,11 @@ fn query_file(path: &Path) -> io::Result<FileFacts> {
             None
         },
         streams,
+        modified: if basic_ok != 0 {
+            Some(basic.LastWriteTime)
+        } else {
+            None
+        },
     })
 }
 

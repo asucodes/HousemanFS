@@ -22,6 +22,7 @@ usage:
   housemanfs info <path>    volume facts for the volume containing <path>
   housemanfs scan <path>    walk <path> and report what occupies space
   housemanfs index <path>   scan <path> and store the result for fast queries
+  housemanfs refresh [path] re-scan and update the index in place
   housemanfs top [n]        largest files in the index (default 20)
   housemanfs dirs [n]       largest directory subtrees (default 20)
   housemanfs find <term>    files whose name contains <term>
@@ -116,6 +117,7 @@ fn main() -> ExitCode {
         "info" => info(&path, &mut out),
         "scan" => scan(&path, &mut out),
         "index" => index::build(&path, &db, &mut out),
+        "refresh" => index::refresh(&db, &path, &mut out),
         "top" => index::top(&db, limit, &mut out),
         "dirs" => index::dirs(&db, limit, &mut out),
         "find" => index::search(&db, &path, limit, &mut out),

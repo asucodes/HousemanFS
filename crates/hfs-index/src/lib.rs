@@ -15,10 +15,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Schema version. Bump only with a migration, never in place.
 ///
-/// Version 2 adds per-entry stream occupancy and provenance, plus the scan-level record that
-/// `explain` reads. Version 1 indexes migrate forward on open; anything else is rejected with
-/// instructions to rebuild, because the index is derived data and a rebuild is always safe.
-pub const SCHEMA_VERSION: u32 = 2;
+/// Version 3 adds the last-write timestamp that refreshes compare for change detection.
+/// Version 2 added per-entry stream occupancy and provenance. Version 1 indexes migrate
+/// forward through each step on open; anything else is rejected with instructions to
+/// rebuild, because the index is derived data and a rebuild is always safe.
+pub const SCHEMA_VERSION: u32 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE meta (
@@ -65,7 +66,8 @@ CREATE TABLE files (
     links        INTEGER NOT NULL,
     stream_bytes INTEGER NOT NULL DEFAULT 0,
     stream_count INTEGER NOT NULL DEFAULT 0,
-    provenance   TEXT NOT NULL DEFAULT 'unknown'
+    provenance   TEXT NOT NULL DEFAULT 'unknown',
+    modified     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX files_allocated ON files(allocated DESC);
@@ -76,7 +78,15 @@ CREATE INDEX dirs_subtree    ON dirs(subtree_allocated DESC);
 CREATE INDEX dirs_path       ON dirs(path);
 "#;
 
-/// Bring a version-1 index forward: stream and provenance columns, backfilled to unknown.
+/// Bring a version-2 index forward: the last-write timestamp that refreshes compare.
+///
+/// Backfilled to 0, which is 1601-01-01 in Windows ticks and therefore never a real
+/// modification time — an unambiguous "unknown". A refresh treats unknown stored
+/// timestamps as changed, so the first refresh after migration re-verifies everything
+/// rather than assuming nothing moved.
+fn migrate_v2_to_v3(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("ALTER TABLE files ADD COLUMN modified INTEGER NOT NULL DEFAULT 0;")
+}
 ///
 /// Backfilling to `unknown` rather than `full` is the honest choice. The v1 rows were
 /// measured, but this build cannot say which queries produced them, and upgrading an
@@ -168,6 +178,9 @@ pub struct FileRow {
     pub stream_bytes: u64,
     pub stream_count: u32,
     pub provenance: FileProvenance,
+    /// Last write time in Windows ticks. 0 means unknown — never a real timestamp — and a
+    /// refresh treats unknown as changed, re-verifying rather than assuming.
+    pub modified: i64,
 }
 
 /// A file together with enough of its location to display.
@@ -180,6 +193,7 @@ pub struct FileHit {
     pub stream_bytes: u64,
     pub stream_count: u32,
     pub provenance: FileProvenance,
+    pub modified: i64,
 }
 
 /// A directory subtree together with enough to display.
@@ -201,6 +215,24 @@ pub struct Summary {
     pub stream_bytes: u64,
 }
 
+/// What a refresh changed, as counted while applying it.
+///
+/// `moved` means the same file identity at a new location — a rename reads this way too,
+/// because at the filesystem level that is what a rename is. `stale` counts rows that could
+/// be neither confirmed nor refuted: their parent was not scanned this refresh, so they
+/// stay, and the count says how many such rows the index carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RefreshReport {
+    pub added_dirs: u64,
+    pub removed_dirs: u64,
+    pub stale_dirs: u64,
+    pub added_files: u64,
+    pub removed_files: u64,
+    pub modified_files: u64,
+    pub moved_files: u64,
+    pub stale_files: u64,
+}
+
 /// One entry's measurements and where they came from: the unit `explain` reports.
 #[derive(Debug, Clone)]
 pub struct ExplainRecord {
@@ -213,6 +245,9 @@ pub struct ExplainRecord {
     pub stream_bytes: u64,
     pub stream_count: u32,
     pub provenance: FileProvenance,
+    /// Last write time in Windows ticks, 0 when unknown. Reported as an age, never as a
+    /// judgment — staleness is a model factor, not an index fact.
+    pub modified: i64,
 }
 
 impl Index {
@@ -254,7 +289,11 @@ impl Index {
         match existing {
             None => conn.execute_batch(SCHEMA)?,
             Some(v) if v == SCHEMA_VERSION => {}
-            Some(1) => migrate_v1_to_v2(&conn)?,
+            Some(2) => migrate_v2_to_v3(&conn)?,
+            Some(1) => {
+                migrate_v1_to_v2(&conn)?;
+                migrate_v2_to_v3(&conn)?;
+            }
             Some(v) => {
                 return Err(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(1),
@@ -279,20 +318,8 @@ impl Index {
         &self.path
     }
 
-    /// Replace the contents of the index with one scan.
-    ///
-    /// Stored in a single transaction so a crash mid-write leaves the previous scan intact
-    /// rather than a half-populated index that looks complete.
-    pub fn write_scan<'a>(
-        &mut self,
-        meta: &ScanMetadata,
-        dirs: impl Iterator<Item = &'a DirRow>,
-        files: impl Iterator<Item = &'a FileRow>,
-    ) -> rusqlite::Result<()> {
-        let tx = self.conn.transaction()?;
-
-        tx.execute_batch("DELETE FROM files; DELETE FROM dirs;")?;
-
+    /// Record the scan in `meta`, replacing the previous record.
+    fn store_meta(tx: &rusqlite::Transaction, meta: &ScanMetadata) -> rusqlite::Result<()> {
         for (key, value) in [
             ("root", meta.root.clone()),
             ("filesystem", meta.filesystem.clone()),
@@ -334,6 +361,23 @@ impl Index {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![meta.volume_id.to_vec()],
         )?;
+        Ok(())
+    }
+
+    /// Replace the contents of the index with one scan.
+    ///
+    /// Stored in a single transaction so a crash mid-write leaves the previous scan intact
+    /// rather than a half-populated index that looks complete.
+    pub fn write_scan<'a>(
+        &mut self,
+        meta: &ScanMetadata,
+        dirs: impl Iterator<Item = &'a DirRow>,
+        files: impl Iterator<Item = &'a FileRow>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+
+        tx.execute_batch("DELETE FROM files; DELETE FROM dirs;")?;
+        Self::store_meta(&tx, meta)?;
 
         {
             let mut stmt = tx.prepare(
@@ -359,8 +403,8 @@ impl Index {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO files (id, parent, name, ext, logical, allocated, links,
-                                    stream_bytes, stream_count, provenance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                    stream_bytes, stream_count, provenance, modified)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for file in files {
                 stmt.execute(params![
@@ -374,6 +418,7 @@ impl Index {
                     file.stream_bytes as i64,
                     file.stream_count,
                     file.provenance.as_str(),
+                    file.modified,
                 ])?;
             }
         }
@@ -381,6 +426,290 @@ impl Index {
         tx.commit()?;
         self.propagate_subtree_totals()?;
         Ok(())
+    }
+
+    /// Fold a fresh scan into the index, touching only what changed.
+    ///
+    /// A rebuild replaces millions of rows to record thousands of changes; a refresh diffs
+    /// the new scan against the stored one inside one transaction and reports the delta.
+    /// Matching is by location first (`parent`, `name`), then by file identity, so a rename
+    /// reads as a move rather than a delete plus an add.
+    ///
+    /// Deletion is conservative on purpose. A row disappears only when its parent directory
+    /// was scanned this refresh and the entry is absent — proof of absence, not absence of
+    /// proof. Rows under directories that were not scanned (denied, or gone along with
+    /// their parent) are left untouched and counted as stale, because deleting an entry
+    /// that still exists would be worse than keeping one that does not. The report says
+    /// which happened.
+    pub fn refresh_scan<'a>(
+        &mut self,
+        meta: &ScanMetadata,
+        dirs: impl Iterator<Item = &'a DirRow>,
+        files: impl Iterator<Item = &'a FileRow>,
+    ) -> rusqlite::Result<RefreshReport> {
+        use std::collections::{HashMap, HashSet};
+
+        let mut report = RefreshReport::default();
+
+        // A stored directory: parent id, path, and the measured fields a refresh compares.
+        type StoredDir = (Option<Vec<u8>>, String, i64, i64, u32, String);
+        // A stored file keyed by (parent, name): identity plus every compared field.
+        type StoredFile = (Vec<u8>, i64, i64, u32, i64, u32, String, i64);
+
+        let mut old_dirs: HashMap<Vec<u8>, StoredDir> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, parent, path, index_bytes, stream_bytes, stream_count, provenance
+                 FROM dirs",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                old_dirs.insert(
+                    row.get(0)?,
+                    (
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ),
+                );
+            }
+        }
+        let old_dir_by_path: HashMap<&str, &Vec<u8>> = old_dirs
+            .iter()
+            .map(|(id, dir)| (dir.1.as_str(), id))
+            .collect();
+
+        // Existing files: (parent, name) -> full row.
+        let mut old_files: HashMap<(Vec<u8>, String), StoredFile> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT parent, name, id, logical, allocated, links,
+                        stream_bytes, stream_count, provenance, modified
+                 FROM files",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let parent: Vec<u8> = row.get(0)?;
+                let name: String = row.get(1)?;
+                old_files.insert(
+                    (parent, name),
+                    (
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ),
+                );
+            }
+        }
+
+        let tx = self.conn.transaction()?;
+
+        // Directories first, so file parentage always resolves against the new tree.
+        let mut new_dir_ids: HashSet<Vec<u8>> = HashSet::new();
+        let mut new_dir_paths: HashSet<&str> = HashSet::new();
+        // Directories that were listed but not entered. Their subtrees are unscanned, so
+        // nothing beneath them may be deleted — and "scanned" below always excludes them.
+        let mut new_denied_ids: HashSet<Vec<u8>> = HashSet::new();
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO dirs (id, parent, name, path, depth, index_bytes,
+                                   stream_bytes, stream_count, provenance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            let mut update = tx.prepare(
+                "UPDATE dirs SET parent = ?2, name = ?3, depth = ?4, index_bytes = ?5,
+                                 stream_bytes = ?6, stream_count = ?7, provenance = ?8
+                 WHERE id = ?1",
+            )?;
+            let mut reidentify = tx.prepare("UPDATE dirs SET id = ?2 WHERE id = ?1")?;
+            let mut reparent_files =
+                tx.prepare("UPDATE files SET parent = ?2 WHERE parent = ?1")?;
+            let mut delete = tx.prepare("DELETE FROM dirs WHERE id = ?1")?;
+
+            for dir in dirs {
+                let id = dir.id.to_vec();
+                new_dir_ids.insert(id.clone());
+                new_dir_paths.insert(dir.path.as_str());
+                if dir.provenance == FileProvenance::Denied {
+                    new_denied_ids.insert(id.clone());
+                }
+
+                if let Some(old) = old_dirs.get(&id) {
+                    if old.2 != dir.index_bytes as i64
+                        || old.3 != dir.stream_bytes as i64
+                        || old.4 != dir.stream_count
+                        || old.5 != dir.provenance.as_str()
+                    {
+                        update.execute(params![
+                            id,
+                            dir.parent.map(|p| p.to_vec()),
+                            dir.name,
+                            dir.depth,
+                            dir.index_bytes as i64,
+                            dir.stream_bytes as i64,
+                            dir.stream_count,
+                            dir.provenance.as_str(),
+                        ])?;
+                    }
+                } else if let Some(old_id) = old_dir_by_path.get(dir.path.as_str()) {
+                    // Same path, new identity: the directory was replaced, not moved.
+                    // Children follow the new identity so they are not orphaned.
+                    reidentify.execute(params![old_id, id])?;
+                    reparent_files.execute(params![id, old_id])?;
+                    update.execute(params![
+                        id,
+                        dir.parent.map(|p| p.to_vec()),
+                        dir.name,
+                        dir.depth,
+                        dir.index_bytes as i64,
+                        dir.stream_bytes as i64,
+                        dir.stream_count,
+                        dir.provenance.as_str(),
+                    ])?;
+                } else {
+                    insert.execute(params![
+                        id,
+                        dir.parent.map(|p| p.to_vec()),
+                        dir.name,
+                        dir.path,
+                        dir.depth,
+                        dir.index_bytes as i64,
+                        dir.stream_bytes as i64,
+                        dir.stream_count,
+                        dir.provenance.as_str(),
+                    ])?;
+                    report.added_dirs += 1;
+                }
+            }
+
+            for (id, (parent, path, ..)) in &old_dirs {
+                if new_dir_paths.contains(path.as_str()) {
+                    continue;
+                }
+                // Gone from the scan. Removed only if the parent was scanned — proof the
+                // directory is truly absent rather than merely unreachable this time. A
+                // denied parent was listed but not entered, so its children prove nothing.
+                let parent_scanned = match parent {
+                    None => false,
+                    Some(parent_id) => old_dirs.get(parent_id).is_some_and(|parent_dir| {
+                        new_dir_paths.contains(parent_dir.1.as_str())
+                            && !new_denied_ids.contains(parent_id)
+                    }),
+                };
+                if parent_scanned {
+                    delete.execute(params![id])?;
+                    report.removed_dirs += 1;
+                } else {
+                    report.stale_dirs += 1;
+                }
+            }
+        }
+
+        // Files, keyed by location, with identity as the fallback for moves.
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO files (id, parent, name, ext, logical, allocated, links,
+                                    stream_bytes, stream_count, provenance, modified)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )?;
+            let mut update = tx.prepare(
+                "UPDATE files SET id = ?3, logical = ?4, allocated = ?5, links = ?6,
+                                  stream_bytes = ?7, stream_count = ?8, provenance = ?9,
+                                  modified = ?10
+                 WHERE parent = ?1 AND name = ?2",
+            )?;
+            let mut relocate = tx.prepare(
+                "UPDATE files SET parent = ?3, name = ?4, logical = ?5, allocated = ?6,
+                                  links = ?7, stream_bytes = ?8, stream_count = ?9,
+                                  provenance = ?10, modified = ?11
+                 WHERE parent = ?1 AND name = ?2",
+            )?;
+            let mut delete = tx.prepare("DELETE FROM files WHERE parent = ?1 AND name = ?2")?;
+
+            // Identity -> current locations, for recognising moves. Owned, so the
+            // file loop below can consume locations while consulting it.
+            let mut by_id: HashMap<Vec<u8>, Vec<(Vec<u8>, String)>> = HashMap::new();
+            for (key, row) in &old_files {
+                by_id.entry(row.0.clone()).or_default().push(key.clone());
+            }
+
+            for file in files {
+                let key = (file.parent.to_vec(), file.name.clone());
+                let fresh = (
+                    file.id.to_vec(),
+                    file.logical as i64,
+                    file.allocated as i64,
+                    file.links,
+                    file.stream_bytes as i64,
+                    file.stream_count,
+                    file.provenance.as_str().to_string(),
+                    file.modified,
+                );
+
+                match old_files.remove(&key) {
+                    Some(old) if old == fresh => {}
+                    Some(_) => {
+                        update.execute(params![
+                            key.0, key.1, fresh.0, fresh.1, fresh.2, fresh.3, fresh.4, fresh.5,
+                            fresh.6, fresh.7
+                        ])?;
+                        report.modified_files += 1;
+                    }
+                    None => {
+                        // Not at this location. Same identity elsewhere means moved or
+                        // renamed; otherwise it is new. (A hardlink group shares one id
+                        // across several keys; the first match consumes one location, and
+                        // any genuinely new name still reads as added.)
+                        let relocated = by_id
+                            .get_mut(&fresh.0)
+                            .and_then(|keys| keys.pop())
+                            .filter(|old_key| old_files.remove(old_key).is_some());
+                        match relocated {
+                            Some((old_parent, old_name)) => {
+                                relocate.execute(params![
+                                    old_parent, old_name, key.0, key.1, fresh.1, fresh.2, fresh.3,
+                                    fresh.4, fresh.5, fresh.6, fresh.7
+                                ])?;
+                                report.moved_files += 1;
+                            }
+                            None => {
+                                insert.execute(params![
+                                    fresh.0, key.0, key.1, file.ext, fresh.1, fresh.2, fresh.3,
+                                    fresh.4, fresh.5, fresh.6, fresh.7
+                                ])?;
+                                report.added_files += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Whatever remains was not seen. Removed only under a scanned parent; anything
+            // else stays, and the report counts it as stale rather than pretending. In
+            // particular, everything under a denied directory stays: the parent was listed
+            // but never entered, so absence proves nothing.
+            for ((parent, name), _) in old_files {
+                if new_dir_ids.contains(&parent) && !new_denied_ids.contains(&parent) {
+                    delete.execute(params![parent, name])?;
+                    report.removed_files += 1;
+                } else {
+                    report.stale_files += 1;
+                }
+            }
+        }
+
+        Self::store_meta(&tx, meta)?;
+        tx.commit()?;
+        self.propagate_subtree_totals()?;
+        Ok(report)
     }
 
     /// Roll each directory's own contents up through its ancestors.
@@ -606,6 +935,8 @@ impl Index {
                 stream_bytes: dir.2,
                 stream_count: dir.3,
                 provenance: FileProvenance::parse(&dir.4),
+                // Directories carry no stored timestamp; an age shown here would be invented.
+                modified: 0,
             }));
         }
 
@@ -615,7 +946,7 @@ impl Index {
         self.conn
             .query_row(
                 "SELECT d.path, f.name, f.logical, f.allocated, f.links,
-                        f.stream_bytes, f.stream_count, f.provenance
+                        f.stream_bytes, f.stream_count, f.provenance, f.modified
                  FROM files f JOIN dirs d ON f.parent = d.id
                  WHERE d.path = ?1 COLLATE NOCASE AND f.name = ?2 COLLATE NOCASE
                  LIMIT 1",
@@ -632,6 +963,7 @@ impl Index {
                         stream_bytes: row.get::<_, i64>(5)? as u64,
                         stream_count: row.get::<_, u32>(6)?,
                         provenance: FileProvenance::parse(&row.get::<_, String>(7)?),
+                        modified: row.get::<_, i64>(8)?,
                     })
                 },
             )
@@ -642,7 +974,7 @@ impl Index {
     pub fn largest_files(&self, limit: u32) -> rusqlite::Result<Vec<FileHit>> {
         let mut stmt = self.conn.prepare(
             "SELECT d.path, f.name, f.logical, f.allocated, f.links,
-                    f.stream_bytes, f.stream_count, f.provenance
+                    f.stream_bytes, f.stream_count, f.provenance, f.modified
              FROM files f JOIN dirs d ON f.parent = d.id
              ORDER BY f.allocated DESC LIMIT ?1",
         )?;
@@ -657,6 +989,7 @@ impl Index {
                 stream_bytes: row.get::<_, i64>(5)? as u64,
                 stream_count: row.get::<_, u32>(6)?,
                 provenance: FileProvenance::parse(&row.get::<_, String>(7)?),
+                modified: row.get::<_, i64>(8)?,
             })
         })?;
         rows.collect()
@@ -692,7 +1025,7 @@ impl Index {
         let pattern = format!("%{escaped}%");
         let mut stmt = self.conn.prepare(
             "SELECT d.path, f.name, f.logical, f.allocated, f.links,
-                    f.stream_bytes, f.stream_count, f.provenance
+                    f.stream_bytes, f.stream_count, f.provenance, f.modified
              FROM files f JOIN dirs d ON f.parent = d.id
              WHERE f.name LIKE ?1 ESCAPE '\\'
              ORDER BY f.allocated DESC LIMIT ?2",
@@ -708,6 +1041,7 @@ impl Index {
                 stream_bytes: row.get::<_, i64>(5)? as u64,
                 stream_count: row.get::<_, u32>(6)?,
                 provenance: FileProvenance::parse(&row.get::<_, String>(7)?),
+                modified: row.get::<_, i64>(8)?,
             })
         })?;
         rows.collect()
@@ -856,6 +1190,7 @@ mod tests {
                 stream_bytes: 4_096,
                 stream_count: 1,
                 provenance: FileProvenance::Full,
+                modified: 0,
             },
             FileRow {
                 id: [3u8; 16],
@@ -868,6 +1203,7 @@ mod tests {
                 stream_bytes: 0,
                 stream_count: 0,
                 provenance: FileProvenance::Full,
+                modified: 0,
             },
         ];
 
@@ -914,6 +1250,7 @@ mod tests {
             stream_bytes: 4_096,
             stream_count: 1,
             provenance: FileProvenance::Full,
+            modified: 0,
         }];
         index
             .write_scan(&meta(), std::iter::once(&dir), files.iter())
@@ -955,6 +1292,7 @@ mod tests {
                 stream_bytes: 0,
                 stream_count: 0,
                 provenance: FileProvenance::Full,
+                modified: 0,
             },
             FileRow {
                 id: [7u8; 16],
@@ -967,6 +1305,7 @@ mod tests {
                 stream_bytes: 0,
                 stream_count: 0,
                 provenance: FileProvenance::Full,
+                modified: 0,
             },
         ];
         index
@@ -1021,6 +1360,7 @@ mod tests {
             stream_bytes: 4_096,
             stream_count: 1,
             provenance: FileProvenance::Full,
+            modified: 0,
         }];
         index
             .write_scan(&meta(), dirs.iter(), files.iter())
@@ -1077,7 +1417,7 @@ CREATE TABLE files (
         }
 
         let index = Index::open(&path).expect("a v1 index migrates on open");
-        assert_eq!(index.meta("schema_version").as_deref(), Some("2"));
+        assert_eq!(index.meta("schema_version").as_deref(), Some("3"));
 
         // The rows survived, and their unknown past is reported as unknown.
         let largest = index.largest_files(1).unwrap();
@@ -1085,6 +1425,7 @@ CREATE TABLE files (
         assert_eq!(largest[0].allocated, 8_192);
         assert_eq!(largest[0].stream_bytes, 0);
         assert_eq!(largest[0].provenance, FileProvenance::Unknown);
+        assert_eq!(largest[0].modified, 0, "no timestamp was ever recorded");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1105,6 +1446,7 @@ CREATE TABLE files (
             stream_bytes: 0,
             stream_count: 0,
             provenance: FileProvenance::Full,
+            modified: 0,
         }];
         index
             .write_scan(&meta(), std::iter::once(&dir), files.iter())
@@ -1114,5 +1456,145 @@ CREATE TABLE files (
         // `%` alone must not match everything.
         assert_eq!(index.search_name("100%", 5).unwrap().len(), 1);
         assert_eq!(index.search_name("%", 5).unwrap().len(), 1);
+    }
+
+    fn file_row(
+        id: [u8; 16],
+        parent: [u8; 16],
+        name: &str,
+        allocated: u64,
+        modified: i64,
+    ) -> FileRow {
+        FileRow {
+            id,
+            parent,
+            name: name.to_string(),
+            ext: extension_of(name),
+            logical: allocated,
+            allocated,
+            links: 1,
+            stream_bytes: 0,
+            stream_count: 0,
+            provenance: FileProvenance::Full,
+            modified,
+        }
+    }
+
+    #[test]
+    fn refresh_updates_only_what_changed() {
+        let mut index = empty();
+        let root = [1u8; 16];
+        let dir = root_dir();
+        let before = [
+            file_row([2u8; 16], root, "steady.txt", 4_096, 100),
+            file_row([3u8; 16], root, "growing.txt", 4_096, 100),
+        ];
+        index
+            .write_scan(&meta(), std::iter::once(&dir), before.iter())
+            .unwrap();
+
+        // One file untouched, one grown: only the grown row is rewritten.
+        let after = [
+            file_row([2u8; 16], root, "steady.txt", 4_096, 100),
+            file_row([3u8; 16], root, "growing.txt", 8_192, 200),
+        ];
+        let report = index
+            .refresh_scan(&meta(), std::iter::once(&dir), after.iter())
+            .unwrap();
+
+        assert_eq!(report.added_files, 0);
+        assert_eq!(report.removed_files, 0);
+        assert_eq!(report.modified_files, 1);
+        assert_eq!(index.summary().unwrap().allocated, 12_288);
+        let grown = index.search_name("growing", 1).unwrap();
+        assert_eq!(grown[0].modified, 200);
+    }
+
+    #[test]
+    fn refresh_counts_adds_removes_and_moves() {
+        let mut index = empty();
+        let root = [1u8; 16];
+        let child = [2u8; 16];
+        let dirs = [
+            root_dir(),
+            DirRow {
+                id: child,
+                parent: Some(root),
+                name: "data".to_string(),
+                path: r"C:\data".to_string(),
+                depth: 1,
+                index_bytes: 0,
+                stream_bytes: 0,
+                stream_count: 0,
+                provenance: FileProvenance::Full,
+            },
+        ];
+        let before = [
+            file_row([3u8; 16], root, "doomed.txt", 4_096, 100),
+            file_row([4u8; 16], root, "traveller.txt", 4_096, 100),
+        ];
+        index
+            .write_scan(&meta(), dirs.iter(), before.iter())
+            .unwrap();
+
+        // doomed.txt is gone (its parent was scanned, so the absence is proof);
+        // traveller.txt moved into data/ keeping its identity; newcomer.txt appeared.
+        let after = [
+            file_row([4u8; 16], child, "traveller.txt", 4_096, 100),
+            file_row([5u8; 16], root, "newcomer.txt", 4_096, 300),
+        ];
+        let report = index
+            .refresh_scan(&meta(), dirs.iter(), after.iter())
+            .unwrap();
+
+        assert_eq!(report.added_files, 1);
+        assert_eq!(report.removed_files, 1);
+        assert_eq!(report.moved_files, 1);
+        assert_eq!(report.modified_files, 0);
+        assert!(index.search_name("doomed", 5).unwrap().is_empty());
+        let moved = index.search_name("traveller", 1).unwrap();
+        assert_eq!(moved[0].path, r"C:\data\traveller.txt");
+    }
+
+    #[test]
+    fn refresh_keeps_rows_under_unscanned_parents() {
+        let mut index = empty();
+        let root = [1u8; 16];
+        let child = [2u8; 16];
+        let scanned_vault = DirRow {
+            id: child,
+            parent: Some(root),
+            name: "vault".to_string(),
+            path: r"C:\vault".to_string(),
+            depth: 1,
+            index_bytes: 0,
+            stream_bytes: 0,
+            stream_count: 0,
+            provenance: FileProvenance::Full,
+        };
+        // The vault is listed but not entered this refresh: its row is present but denied,
+        // and its contents are absent. Deleting secret.txt would confuse "could not look"
+        // with "looked and found nothing", so it stays and is counted as stale.
+        let denied_vault = DirRow {
+            provenance: FileProvenance::Denied,
+            ..scanned_vault.clone()
+        };
+        let before = [file_row([3u8; 16], child, "secret.txt", 4_096, 100)];
+        index
+            .write_scan(&meta(), [root_dir(), scanned_vault].iter(), before.iter())
+            .unwrap();
+
+        let report = index
+            .refresh_scan(
+                &meta(),
+                [root_dir(), denied_vault].iter(),
+                std::iter::empty(),
+            )
+            .unwrap();
+
+        assert_eq!(report.removed_files, 0);
+        assert_eq!(report.removed_dirs, 0);
+        assert_eq!(report.stale_files, 1);
+        assert_eq!(index.search_name("secret", 5).unwrap().len(), 1);
     }
 }

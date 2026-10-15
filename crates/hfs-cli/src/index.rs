@@ -8,9 +8,10 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use hfs_core::FileProvenance;
-use hfs_index::{DirRow, FileRow, Index, ScanMetadata, extension_of};
+use hfs_index::{DirRow, FileRow, Index, RefreshReport, ScanMetadata, extension_of};
 use hfs_win::{
-    BackupPrivilege, EntryKind, WalkOptions, is_elevated, path_facts, volume_info, walk_with,
+    BackupPrivilege, EntryKind, WalkOptions, WalkSummary, is_elevated, path_facts, volume_info,
+    walk_with,
 };
 
 use crate::human;
@@ -20,6 +21,66 @@ pub const DEFAULT_INDEX: &str = "housemanfs.db";
 
 /// Scan `path` and store the result, replacing whatever was there.
 pub fn build(path: &str, db: &str, out: &mut String) -> Result<(), String> {
+    let _ = writeln!(out, "index       {db}");
+    let scan = collect(path, out)?;
+
+    let mut index = Index::open(db).map_err(|e| e.to_string())?;
+    index
+        .write_scan(&scan.meta, scan.dirs.iter(), scan.files.iter())
+        .map_err(|e| e.to_string())?;
+
+    print_stored(out, &scan);
+    Ok(())
+}
+
+/// Re-scan and fold the result into the existing index, touching only what changed.
+///
+/// Refuses to run against an index built from a different volume: volume identity survives
+/// remounting, so a mismatch means the index is not this path's past, and merging them
+/// would corrupt both histories. Rebuild instead. The check runs before the walk, because a
+/// refused refresh must not cost a full scan.
+pub fn refresh(db: &str, path: &str, out: &mut String) -> Result<(), String> {
+    let mut index = open(db)?;
+    let stored = index.scan_metadata();
+    let root = if path.is_empty() {
+        stored.root.clone()
+    } else {
+        path.to_string()
+    };
+    if root.is_empty() {
+        return Err("no path to refresh: pass one explicitly".to_string());
+    }
+
+    let live = volume_info(&root).map_err(|e| e.to_string())?;
+    if *live.volume_id.as_bytes() != stored.volume_id && stored.volume_id != [0u8; 16] {
+        return Err(format!(
+            "index covers volume {} but {root} is a different volume; rebuild with `index`",
+            stored.root
+        ));
+    }
+
+    let scan = collect(&root, out)?;
+    let report = index
+        .refresh_scan(&scan.meta, scan.dirs.iter(), scan.files.iter())
+        .map_err(|e| e.to_string())?;
+
+    print_refresh(out, &report);
+    Ok(())
+}
+
+/// One walk, converted to index rows and scan facts.
+struct CollectedScan {
+    dirs: Vec<DirRow>,
+    files: Vec<FileRow>,
+    meta: ScanMetadata,
+    summary: WalkSummary,
+}
+
+/// One walk, converted to index rows and scan facts.
+///
+/// Shared by full builds and refreshes: the walk is the expensive part, and both commands
+/// must agree on how entries become rows or their results would silently diverge.
+fn collect(path: &str, out: &mut String) -> Result<CollectedScan, String> {
     // Same as a scan: ask for the backup privilege, so protected files are measured rather
     // than estimated from what the directory entry claims.
     let backup = hfs_win::enable_backup_privilege();
@@ -27,7 +88,6 @@ pub fn build(path: &str, db: &str, out: &mut String) -> Result<(), String> {
     let volume = volume_info(path).map_err(|e| e.to_string())?;
 
     let _ = writeln!(out, "scanning    {path}");
-    let _ = writeln!(out, "index       {db}");
     if !backup.is_active() {
         let _ = writeln!(
             out,
@@ -105,6 +165,18 @@ pub fn build(path: &str, db: &str, out: &mut String) -> Result<(), String> {
                 // its target would double-count.
             }
             EntryKind::Directory => {
+                // A denied directory was listed but not entered: its row marks the subtree
+                // as unscanned, so a refresh keeps the rows beneath it instead of reading
+                // the absence as deletion.
+                let provenance = if entry.denied {
+                    FileProvenance::Denied
+                } else if !entry.streams_known {
+                    FileProvenance::NoStreams
+                } else if entry.id.is_none() {
+                    FileProvenance::NoIdentity
+                } else {
+                    FileProvenance::Full
+                };
                 dirs.push(DirRow {
                     id: dir_ids[&path],
                     parent: dir_ids.get(&parent_key).copied(),
@@ -114,13 +186,7 @@ pub fn build(path: &str, db: &str, out: &mut String) -> Result<(), String> {
                     index_bytes: entry.allocated,
                     stream_bytes: entry.stream_bytes,
                     stream_count: entry.stream_count,
-                    provenance: if !entry.streams_known {
-                        FileProvenance::NoStreams
-                    } else if entry.id.is_none() {
-                        FileProvenance::NoIdentity
-                    } else {
-                        FileProvenance::Full
-                    },
+                    provenance,
                 });
             }
             EntryKind::File => {
@@ -153,6 +219,9 @@ pub fn build(path: &str, db: &str, out: &mut String) -> Result<(), String> {
                     stream_bytes: entry.stream_bytes,
                     stream_count: entry.stream_count,
                     provenance,
+                    // Unknown timestamps store as 0, which a later refresh reads as
+                    // "changed" — re-verifying is safe, assuming stasis is not.
+                    modified: entry.modified.unwrap_or(0),
                 });
             }
         }
@@ -187,41 +256,85 @@ pub fn build(path: &str, db: &str, out: &mut String) -> Result<(), String> {
         hardlink_extra_names: result.summary.hardlink_extra_names,
     };
 
-    let mut index = Index::open(db).map_err(|e| e.to_string())?;
-    index
-        .write_scan(&meta, dirs.iter(), files.iter())
-        .map_err(|e| e.to_string())?;
+    Ok(CollectedScan {
+        dirs,
+        files,
+        meta,
+        summary: result.summary,
+    })
+}
 
+/// What a full build stored, in the words the build reports.
+fn print_stored(out: &mut String, scan: &CollectedScan) {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
         "stored      {} directories, {} files",
-        dirs.len(),
-        files.len()
+        scan.dirs.len(),
+        scan.files.len()
     );
     let _ = writeln!(
         out,
         "occupying   {} of file data",
-        human(result.summary.allocated_bytes)
+        human(scan.summary.allocated_bytes)
     );
-    if result.summary.stream_count > 0 {
+    if scan.summary.stream_count > 0 {
         let _ = writeln!(
             out,
             "            {} in {} named {}",
-            human(result.summary.stream_bytes),
-            result.summary.stream_count,
-            plural(result.summary.stream_count, "stream", "streams"),
+            human(scan.summary.stream_bytes),
+            scan.summary.stream_count,
+            plural(scan.summary.stream_count, "stream", "streams"),
         );
     }
-    if result.summary.denied_directories > 0 {
+    if scan.summary.denied_directories > 0 {
         let _ = writeln!(
             out,
             "note        {} directories were unreadable and are absent",
-            result.summary.denied_directories
+            scan.summary.denied_directories
         );
     }
+}
 
-    Ok(())
+/// What a refresh changed. Only nonzero lines print: a quiet refresh that found nothing is
+/// the common case, and a wall of zeros would bury the days when something moved.
+fn print_refresh(out: &mut String, report: &RefreshReport) {
+    let _ = writeln!(out);
+    let _ = writeln!(out, "refresh     complete");
+    let files = report.added_files + report.removed_files + report.modified_files;
+    if files == 0 && report.moved_files == 0 {
+        let _ = writeln!(out, "            nothing changed");
+    }
+    if report.added_files > 0 {
+        let _ = writeln!(out, "added       {} files", report.added_files);
+    }
+    if report.removed_files > 0 {
+        let _ = writeln!(out, "removed     {} files", report.removed_files);
+    }
+    if report.modified_files > 0 {
+        let _ = writeln!(out, "modified    {} files", report.modified_files);
+    }
+    if report.moved_files > 0 {
+        let _ = writeln!(
+            out,
+            "moved       {} files (same data, new location)",
+            report.moved_files
+        );
+    }
+    if report.added_dirs + report.removed_dirs > 0 {
+        let _ = writeln!(
+            out,
+            "directories +{} -{}",
+            report.added_dirs, report.removed_dirs
+        );
+    }
+    if report.stale_files + report.stale_dirs > 0 {
+        let _ = writeln!(
+            out,
+            "note        {} files and {} directories were not rescanned and are kept as-is",
+            report.stale_files, report.stale_dirs
+        );
+    }
 }
 
 /// The largest files by occupied size.
@@ -340,6 +453,11 @@ pub fn explain(db: &str, path: &str, out: &mut String) -> Result<(), String> {
             "identity    {} names share this data; counted once",
             record.links
         );
+    }
+    if record.kind == "file" {
+        // An age, not a verdict. Whether old means "abandoned" is a model factor with a
+        // confidence attached, not something the index declares.
+        let _ = writeln!(out, "modified    {}", format_age(record.modified));
     }
     match (record.stream_count, record.provenance) {
         (0, FileProvenance::Full | FileProvenance::NoIdentity) => {
@@ -496,6 +614,51 @@ fn write_stream_note(out: &mut String, bytes: u64, count: u32) {
     }
 }
 
+/// A Windows timestamp as an age. 0 means unknown and is shown as unknown — "a long time
+/// ago" would be a guess wearing a measurement's clothes.
+fn format_age(modified: i64) -> String {
+    if modified <= 0 {
+        return "unknown".to_string();
+    }
+    let now = windows_ticks_now();
+    if modified > now {
+        return "in the future — the clock moved, not the file".to_string();
+    }
+    const TICK: i64 = 10_000_000;
+    let seconds = (now - modified) / TICK;
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 3_600;
+    const DAY: i64 = 86_400;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    let (value, unit) = if seconds < MINUTE {
+        (seconds, "second")
+    } else if seconds < HOUR {
+        (seconds / MINUTE, "minute")
+    } else if seconds < DAY {
+        (seconds / HOUR, "hour")
+    } else if seconds < MONTH {
+        (seconds / DAY, "day")
+    } else if seconds < YEAR {
+        (seconds / MONTH, "month")
+    } else {
+        (seconds / YEAR, "year")
+    };
+    format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
+}
+
+/// Current time in Windows ticks, without depending on a datetime crate for one call.
+///
+/// Full precision matters: truncating to whole seconds would leave the clock up to a second
+/// behind a file written "now", and every fresh file would read as modified in the future.
+fn windows_ticks_now() -> i64 {
+    const UNIX_TO_WINDOWS_TICKS: u128 = 11_644_473_600 * 10_000_000;
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_nanos() / 100 + UNIX_TO_WINDOWS_TICKS) as i64)
+        .unwrap_or(0)
+}
+
 /// Pick the singular or plural form. A report that says "1 streams" is a small
 /// carelessness, and carelessness compounds in a tool that asks to be trusted.
 pub(crate) fn plural(count: u64, singular: &'static str, plural: &'static str) -> &'static str {
@@ -590,4 +753,30 @@ fn truncate(path: &str, limit: usize) -> String {
     let end: String = path.chars().rev().take(tail).collect::<String>();
     let end: String = end.chars().rev().collect();
     format!("{start}...{end}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ages_read_as_ages() {
+        assert_eq!(format_age(0), "unknown");
+        assert_eq!(format_age(-5), "unknown");
+        let now = windows_ticks_now();
+        // A file written this instant is seconds old, never from the future.
+        assert!(format_age(now - 30 * 10_000_000).starts_with("30 second"));
+        assert!(format_age(now - 3 * 86_400 * 10_000_000).starts_with("3 day"));
+        assert!(format_age(now - 400 * 86_400 * 10_000_000).starts_with("1 year"));
+    }
+
+    #[test]
+    fn the_clock_keeps_sub_second_precision() {
+        // Two consecutive reads must not go backwards, and the clock must resolve below
+        // one second — truncation once made every fresh file read as future-dated.
+        let first = windows_ticks_now();
+        let second = windows_ticks_now();
+        assert!(second >= first);
+        assert!(second % 10_000_000 != 0 || first % 10_000_000 != 0);
+    }
 }
