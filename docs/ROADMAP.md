@@ -6,12 +6,37 @@ accounting being correct, so the accounting gets built and verified first.
 
 ## Current status
 
-Phase 0 has started. The toolchain is installed and pinned (Rust 1.98.1, GNU target). `hfs-core`
-holds the accounting model: file identity, extent ownership, and volume-level reconciliation
-with an explicit residual — 17 tests, all passing.
+Phase 0 is nearly closed; Phase 1 is half built. The walk scans real volumes and reconciles
+against the filesystem with a decomposed residual — 45 tests passing, plus a CI workflow
+running fmt, clippy and the suite on Windows.
 
-Nothing scans a real volume yet. That is the next step, and it is the point where the model
-stops being a claim and becomes a measurement.
+Measured on `C:\`, October 2026 (NTFS, 302 GiB volume):
+
+- **Elevated:** 1.31M files, unaccounted **7.13 GiB / 2.36%** — MFT (1.98 GiB), NTFS system
+  files and directory overhead (496 MiB) all measured, not estimated.
+- **Standard user:** unaccounted ~13.5%, dominated by 516 unreadable directories and refused
+  filesystem-metadata queries. The gap is access, not accounting: every unknown byte is
+  named as unknown.
+- **Alternate streams:** enumerated per file on allocation size — 1,293 streams totalling
+  352 KiB on the measured volume. Small there, which is itself a finding: streams are not
+  where this volume's space went.
+
+Two platform facts are now recorded rather than discovered repeatedly: `FileStreamInfo`
+fails on directory handles (`ERROR_HANDLE_EOF`), so directory streams are disclosed once
+in the report instead of counted; and the residual's 2% tolerance is still a stated
+constant, not a calibrated value — closing Phase 0 means either meeting it elevated or
+writing down why it is what it is.
+
+Beyond the walk: the index (schema v2) stores per-entry stream occupancy and provenance,
+counts hardlink groups once in every aggregate, and carries the scan record; `explain`
+shows the measurement behind any indexed path, and `export` publishes a versioned JSON
+snapshot. The read-only invariant is enforced by an audit test, and the walk is covered
+by a synthetic fixture test containing no real filesystem data.
+
+Still missing for Phase 0's exit: an elevated re-scan with streams (expected to land at
+or under tolerance), and reconciliation against the independent reference (`fsutil`).
+Still missing for Phase 1: incremental index updates, natural-language search, and the
+`hfs-model` boundary those depend on.
 
 ## Phase 0 — the accounting oracle
 
@@ -31,11 +56,17 @@ model on a wrong index produces confident wrong answers faster, which is worse t
 ## Phase 1 — index, ask, explain (v1)
 
 **Deliverables.**
-- A persistent, incrementally-updatable index with a versioned schema.
+- A persistent, incrementally-updatable index with a versioned schema. **Part done:** the
+  index exists at schema v2 with per-entry provenance, stream occupancy and hardlink-aware
+  aggregates, plus a versioned JSON export. Incremental updates are not done — every build
+  is a full re-scan.
 - Natural-language search over that index. The model translates a question into a query; queries
-  only read.
-- `explain` — for any figure, show the measurement behind it.
-- A minimal interface. Read-only, and visibly so.
+  only read. **Not done:** search today is literal substring matching. The `hfs-model`
+  boundary it depends on does not exist yet.
+- `explain` — for any figure, show the measurement behind it. **Done** for indexed paths:
+  `housemanfs explain <path>` reports each figure with the query that produced it.
+- A minimal interface. Read-only, and visibly so. **Done:** the finder renders the index
+  and cannot initiate an action.
 
 **Exit criteria.** A user can point it at a real drive and get a correct, inspectable answer to
 "where did my space go", including an honest reclaim figure.
@@ -50,6 +81,11 @@ documented export format.
   compressibility.
 - Suggestions assembled from those factors by versioned rules, each one inspectable.
 - Confidence gating: below threshold, the tool says nothing.
+
+**Status.** The boundary is scaffolded ahead of the engine: `hfs-model` owns state
+assembly, the versioned question set and the engine trait, with a stub engine returning
+maximum uncertainty so the pipeline and its tests exist before any model does. Still
+missing: engine selection (D4), the evaluation set, and the combination rules.
 
 **Exit criteria.** Suggestions are correct often enough to be useful, measured against a
 committed evaluation set — and the evaluation set contains no real filesystem data.
